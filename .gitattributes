@@ -1,0 +1,4 @@
+# Normalize line endings to LF on all platforms. The schema_drift test
+# compares committed schemas/*.json byte-for-byte against serde_json output
+# (always LF), so a CRLF checkout on Windows would spuriously fail.
+* text=auto eol=lf
