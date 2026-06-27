@@ -1,0 +1,36 @@
+[package]
+name = "quarto-error-reporting"
+version = "0.1.0"
+edition = "2024"
+authors = ["Posit Software, PBC"]
+license = "MIT"
+description = "Structured, source-aware diagnostics (ariadne-rendered) with a pluggable error-code catalog."
+repository = "https://github.com/posit-dev/quarto-error-reporting"
+homepage = "https://github.com/posit-dev/quarto-error-reporting"
+readme = "README.md"
+keywords = ["diagnostics", "error-reporting", "ariadne", "errors"]
+categories = ["development-tools", "rust-patterns"]
+
+[dependencies]
+# Source location tracking (published leaf crate).
+quarto-source-map = "0.1.0"
+
+# Error reporting
+ariadne = "0.6"
+thiserror = "2.0"
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+# JSON Schema generation for the wire format, behind the `json` feature.
+schemars = { version = "1.2.1", optional = true }
+
+# URL handling for file:// hyperlinks
+url = "2.5"
+
+[features]
+# The `json.rs` wire shape (JsonDiagnostic etc.) and its `schemars`
+# dependency are opt-in. Default-off so a consumer that only needs the
+# diagnostic/builder/render API gets a leaner build with no schemars.
+json = ["dep:schemars"]

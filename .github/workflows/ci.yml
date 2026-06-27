@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Default features (json OFF) must build with no schemars — the lean
+      # path for consumers that only need the diagnostic/builder/render API.
+      - name: Build (default features)
+        run: cargo build --all-targets --locked
+
+      - name: Test (default features)
+        run: cargo test --locked
+
+      # All features (json ON) exercises the wire shape + schema_drift test.
+      - name: Test (--all-features)
+        run: cargo test --all-features --locked
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (default features)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: clippy (--all-features)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
