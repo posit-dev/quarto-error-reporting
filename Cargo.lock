@@ -3,6 +3,23 @@
 version = 4
 
 [[package]]
+name = "annotate-snippets"
+version = "0.12.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f211a51805bc641f3ad5b7664c77d2547af685cc33b4cd8d31964027a46f13f1"
+dependencies = [
+ "anstyle",
+ "memchr",
+ "unicode-width",
+]
+
+[[package]]
+name = "anstyle"
+version = "1.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
+
+[[package]]
 name = "ariadne"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -187,6 +204,7 @@ dependencies = [
 name = "quarto-error-reporting"
 version = "0.1.0"
 dependencies = [
+ "annotate-snippets",
  "ariadne",
  "quarto-source-map",
  "schemars",

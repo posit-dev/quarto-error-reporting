@@ -86,7 +86,8 @@ pub use catalog::{
 };
 pub use coalesce::{CoalescedDiagnostic, coalesce_by_source};
 pub use diagnostic::{
-    DetailItem, DetailKind, DiagnosticKind, DiagnosticMessage, MessageContent, TextRenderOptions,
+    DetailItem, DetailKind, DiagnosticKind, DiagnosticMessage, MessageContent, SourceRenderer,
+    TextRenderOptions,
 };
 #[cfg(feature = "json")]
 pub use json::{
