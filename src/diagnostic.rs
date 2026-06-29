@@ -1023,11 +1023,7 @@ impl DiagnosticMessage {
         let mut snippet = Snippet::source(content.as_str())
             .path(file.path.as_str())
             .line_start(1)
-            .annotation(
-                AnnotationKind::Primary
-                    .span(main_span)
-                    .label(main_message),
-            );
+            .annotation(AnnotationKind::Primary.span(main_span).label(main_message));
 
         // Detail locations in the same file become Context annotations.
         for detail in &self.details {
@@ -1521,8 +1517,7 @@ mod tests {
         use crate::builder::DiagnosticMessageBuilder;
 
         let mut ctx = quarto_source_map::SourceContext::new();
-        let file_id =
-            ctx.add_file("a.qmd".to_string(), Some("alpha\nbeta\ngamma".to_string()));
+        let file_id = ctx.add_file("a.qmd".to_string(), Some("alpha\nbeta\ngamma".to_string()));
         let location = quarto_source_map::SourceInfo::original(file_id, 6, 10); // "beta"
         let msg = DiagnosticMessageBuilder::error("Pick a style")
             .with_location(location)
@@ -1531,8 +1526,7 @@ mod tests {
             enable_hyperlinks: false,
         };
 
-        let ariadne =
-            msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
+        let ariadne = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
         let snippets =
             msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::AnnotateSnippets));
 

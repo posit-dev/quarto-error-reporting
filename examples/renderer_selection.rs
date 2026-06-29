@@ -10,9 +10,9 @@
 //! structured data (title, code, problem, location) is identical — only
 //! the source-excerpt block differs.
 
-use quarto_error_reporting::{DiagnosticMessageBuilder, TextRenderOptions};
 #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
 use quarto_error_reporting::SourceRenderer;
+use quarto_error_reporting::{DiagnosticMessageBuilder, TextRenderOptions};
 use quarto_source_map::{SourceContext, SourceInfo};
 
 fn main() {
@@ -54,11 +54,7 @@ fn main() {
         println!("=== SourceRenderer::AnnotateSnippets ===\n");
         println!(
             "{}",
-            diag.to_text_with_renderer(
-                Some(&ctx),
-                &opts,
-                Some(SourceRenderer::AnnotateSnippets),
-            )
+            diag.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::AnnotateSnippets),)
         );
     }
 }
