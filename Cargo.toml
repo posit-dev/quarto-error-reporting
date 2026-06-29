@@ -8,16 +8,20 @@ resolver = "3"
 
 [package]
 name = "quarto-error-reporting"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Posit Software, PBC"]
 license = "MIT"
-description = "Structured, source-aware diagnostics (ariadne-rendered) with a pluggable error-code catalog."
+description = "Structured, source-aware diagnostics with pluggable rendering (ariadne or annotate-snippets) and a pluggable error-code catalog."
 repository = "https://github.com/posit-dev/quarto-error-reporting"
 homepage = "https://github.com/posit-dev/quarto-error-reporting"
 readme = "README.md"
-keywords = ["diagnostics", "error-reporting", "ariadne", "errors"]
+keywords = ["diagnostics", "error-reporting", "ariadne", "annotate-snippets"]
 categories = ["development-tools", "rust-patterns"]
+
+# Keep internal tooling and planning docs out of the published artifact.
+# (`xtask/` is a nested package and is excluded automatically.)
+exclude = [".cargo", ".claude", ".github", "claude-notes", "CLAUDE.md"]
 
 [dependencies]
 # Source location tracking (published leaf crate).
