@@ -1,0 +1,4 @@
+# `cargo xtask <task>` runs the local CI runner in `xtask/`.
+# Currently the only task is `verify` (mirrors .github/workflows/ci.yml).
+[alias]
+xtask = "run --package xtask --quiet --"

@@ -1,5 +1,29 @@
 # quarto-error-reporting
 
+## **PRE-FLIGHT: run `cargo xtask verify` before pushing**
+
+CI (`.github/workflows/ci.yml`) gates every PR on **formatting, clippy, and
+tests across feature sets**. To avoid a red CI round-trip, run the local
+mirror **before committing/pushing**:
+
+```bash
+cargo xtask verify
+```
+
+This runs exactly what CI runs, in order: `cargo fmt --all --check`, then
+`cargo clippy --all-targets` and `--all-features` (both with `-D warnings`),
+then `cargo build --all-targets`, `cargo test`, and `cargo test
+--all-features` — all `--locked`. A green `verify` means a green CI (modulo
+the OS matrix; this runs on your host only). The task lives in `xtask/`; keep
+its `STEPS` list in sync if the workflow changes.
+
+**Most common CI failure: formatting.** `cargo fmt --all --check` fails on any
+unformatted Rust — including hand-written code that looks fine but disagrees
+with rustfmt (multi-line builder chains, import grouping, trailing commas).
+**Always run `cargo fmt --all` before committing Rust**, or just let
+`cargo xtask verify` catch it. Note also that CI builds with **`--locked`**, so
+commit `Cargo.lock` when dependencies change.
+
 ## **WORK TRACKING**
 
 We use **braid** for issue tracking instead of Markdown TODOs or external tools.

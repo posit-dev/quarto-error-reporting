@@ -1,0 +1,8 @@
+# Local CI runner. Mirrors `.github/workflows/ci.yml` so contributors can
+# reproduce the full CI gate with one command: `cargo xtask verify`.
+# Intentionally dependency-free (std only) and never published.
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+publish = false

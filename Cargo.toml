@@ -1,3 +1,11 @@
+# This crate is also the workspace root. The only extra member is `xtask`,
+# the local CI runner (`cargo xtask verify`) — see `.cargo/config.toml`.
+# `xtask` has `publish = false` and lives in its own subdirectory, so it is
+# automatically excluded from this crate's published artifact.
+[workspace]
+members = ["xtask"]
+resolver = "3"
+
 [package]
 name = "quarto-error-reporting"
 version = "0.1.0"
