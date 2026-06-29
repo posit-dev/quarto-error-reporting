@@ -58,6 +58,60 @@ impl Default for TextRenderOptions {
     }
 }
 
+/// Selects which source-context snippet renderer draws the visual code
+/// excerpt in [`DiagnosticMessage::to_text_with_renderer`].
+///
+/// The available variants depend on which renderer features are enabled
+/// at compile time, so this enum is `#[non_exhaustive]`: with neither
+/// `ariadne` nor `annotate-snippets` enabled it has no variants at all,
+/// and downstream `match`es must include a wildcard arm to stay
+/// compiling across feature combinations.
+///
+/// Pass `None` to [`DiagnosticMessage::to_text_with_renderer`] (or use
+/// [`DiagnosticMessage::to_text`] / [`DiagnosticMessage::to_text_with_options`])
+/// to let the crate pick a default via [`SourceRenderer::default_for_features`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SourceRenderer {
+    /// [ariadne](https://crates.io/crates/ariadne)-style rendering: a
+    /// boxed source excerpt. Available with the `ariadne` feature (on by
+    /// default).
+    #[cfg(feature = "ariadne")]
+    Ariadne,
+    /// [annotate-snippets](https://crates.io/crates/annotate-snippets)-style
+    /// rendering: the rust-lang toolchain's `-->` / gutter-bar look.
+    /// Available with the `annotate-snippets` feature.
+    #[cfg(feature = "annotate-snippets")]
+    AnnotateSnippets,
+}
+
+impl SourceRenderer {
+    /// The renderer used when the caller does not specify one.
+    ///
+    /// Prefers [`SourceRenderer::Ariadne`] when the `ariadne` feature is
+    /// enabled (preserving historical behavior), then falls back to
+    /// [`SourceRenderer::AnnotateSnippets`]. Returns `None` when no
+    /// renderer feature is enabled, in which case `to_text` drops the
+    /// source-context snippet and prints the structured text block.
+    pub fn default_for_features() -> Option<Self> {
+        // Exactly one of these `#[cfg]` blocks survives in any feature
+        // configuration, so the surviving block is the function's tail
+        // expression — no `return` and no unreachable code.
+        #[cfg(feature = "ariadne")]
+        {
+            Some(Self::Ariadne)
+        }
+        #[cfg(all(not(feature = "ariadne"), feature = "annotate-snippets"))]
+        {
+            Some(Self::AnnotateSnippets)
+        }
+        #[cfg(all(not(feature = "ariadne"), not(feature = "annotate-snippets")))]
+        {
+            None
+        }
+    }
+}
+
 /// The content of a message or detail item.
 ///
 /// This will eventually support Pandoc AST for rich formatting, but starts
@@ -353,17 +407,57 @@ impl DiagnosticMessage {
         ctx: Option<&quarto_source_map::SourceContext>,
         options: &TextRenderOptions,
     ) -> String {
+        self.to_text_with_renderer(ctx, options, None)
+    }
+
+    /// Like [`Self::to_text_with_options`], but explicitly selects which
+    /// source-context snippet renderer draws the visual code excerpt.
+    ///
+    /// Pass `Some(SourceRenderer::Ariadne)` or
+    /// `Some(SourceRenderer::AnnotateSnippets)` to force a specific
+    /// renderer (the corresponding feature must be enabled), or `None`
+    /// to use [`SourceRenderer::default_for_features`]. This is the seam
+    /// for experimenting with diagnostic rendering styles without
+    /// changing the rest of the API: only the source-excerpt block
+    /// differs between renderers; the surrounding structured text
+    /// (unlocated details, hints) is identical.
+    ///
+    /// When no renderer feature is enabled — or the diagnostic has no
+    /// location / source context — this falls back to the structured
+    /// tidyverse-style text block, exactly as [`Self::to_text_with_options`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use quarto_error_reporting::{DiagnosticMessageBuilder, TextRenderOptions};
+    ///
+    /// let msg = DiagnosticMessageBuilder::error("Invalid input")
+    ///     .problem("Values must be numeric")
+    ///     .build();
+    ///
+    /// // `None` picks the default renderer for the enabled features.
+    /// let text = msg.to_text_with_renderer(None, &TextRenderOptions::default(), None);
+    /// assert!(text.contains("Invalid input"));
+    /// ```
+    pub fn to_text_with_renderer(
+        &self,
+        ctx: Option<&quarto_source_map::SourceContext>,
+        options: &TextRenderOptions,
+        renderer: Option<SourceRenderer>,
+    ) -> String {
         use std::fmt::Write;
 
         let mut result = String::new();
 
-        // Check if we have any location info that could be displayed with ariadne
-        // This includes the main diagnostic location OR any detail with a location
+        // Check if we have any location info that could be displayed in a
+        // source excerpt. This includes the main diagnostic location OR
+        // any detail with a location.
         let has_any_location =
             self.location.is_some() || self.details.iter().any(|d| d.location.is_some());
 
-        // If we have location info and source context, render ariadne source display
-        let has_ariadne = if let (true, Some(ctx_val)) = (has_any_location, ctx) {
+        // If we have location info and source context, render the source
+        // excerpt with the selected (or default) renderer.
+        let has_source_render = if let (true, Some(ctx_val)) = (has_any_location, ctx) {
             // Use main location if available, otherwise use first detail location
             let location = self
                 .location
@@ -371,10 +465,10 @@ impl DiagnosticMessage {
                 .or_else(|| self.details.iter().find_map(|d| d.location.as_ref()));
 
             if let Some(loc) = location {
-                if let Some(ariadne_output) =
-                    self.render_ariadne_source_context(loc, ctx_val, options.enable_hyperlinks)
+                if let Some(snippet_output) =
+                    self.render_source_context(loc, ctx_val, options.enable_hyperlinks, renderer)
                 {
-                    result.push_str(&ariadne_output);
+                    result.push_str(&snippet_output);
                     true
                 } else {
                     false
@@ -386,11 +480,11 @@ impl DiagnosticMessage {
             false
         };
 
-        // If we don't have ariadne output, show full tidyverse-style content
-        // If we do have ariadne, only show details without locations and hints
-        // (ariadne already shows: title, code, problem, and details with locations)
-        if !has_ariadne {
-            // No ariadne - show everything in tidyverse style
+        // If we don't have a source excerpt, show full tidyverse-style content.
+        // If we do, only show details without locations and hints
+        // (the renderer already shows: title, code, problem, and located details)
+        if !has_source_render {
+            // No source excerpt - show everything in tidyverse style
 
             // Title with kind prefix and error code (e.g., "Error [Q-1-1]: Invalid input")
             let kind_str = match self.kind {
@@ -449,10 +543,10 @@ impl DiagnosticMessage {
                 writeln!(result, "ℹ {}", hint.as_str()).unwrap();
             }
         } else {
-            // Have ariadne - only show details without locations and hints
-            // (ariadne shows title, code, problem, and located details)
+            // Have a source excerpt - only show details without locations and hints
+            // (the renderer shows title, code, problem, and located details)
 
-            // Details without locations (ariadne can't show these)
+            // Details without locations (the source excerpt can't show these)
             for detail in &self.details {
                 if detail.location.is_none() {
                     let bullet = match detail.kind {
@@ -557,6 +651,37 @@ impl DiagnosticMessage {
         obj
     }
 
+    /// Dispatch to the selected source-context renderer.
+    ///
+    /// `renderer` of `None` resolves to [`SourceRenderer::default_for_features`].
+    /// Returns `None` when no renderer is available (no renderer feature
+    /// enabled) or the chosen renderer could not draw the excerpt (e.g.
+    /// the file content is unavailable — common in WASM), in which case
+    /// the caller falls back to the structured text block.
+    #[cfg_attr(
+        not(any(feature = "ariadne", feature = "annotate-snippets")),
+        allow(unused_variables)
+    )]
+    fn render_source_context(
+        &self,
+        main_location: &quarto_source_map::SourceInfo,
+        ctx: &quarto_source_map::SourceContext,
+        enable_hyperlinks: bool,
+        renderer: Option<SourceRenderer>,
+    ) -> Option<String> {
+        let renderer = renderer.or_else(SourceRenderer::default_for_features)?;
+        match renderer {
+            #[cfg(feature = "ariadne")]
+            SourceRenderer::Ariadne => {
+                self.render_ariadne_source_context(main_location, ctx, enable_hyperlinks)
+            }
+            #[cfg(feature = "annotate-snippets")]
+            SourceRenderer::AnnotateSnippets => {
+                self.render_annotate_snippets_source_context(main_location, ctx, enable_hyperlinks)
+            }
+        }
+    }
+
     /// Wrap a file path with OSC 8 ANSI hyperlink codes for clickable terminal links.
     ///
     /// OSC 8 is a terminal escape sequence that creates clickable hyperlinks:
@@ -577,7 +702,9 @@ impl DiagnosticMessage {
     /// and other terminal emulators for opening files at specific positions.
     ///
     /// Returns the wrapped path if conditions are met, otherwise returns the original path.
-    #[cfg(not(target_family = "wasm"))]
+    ///
+    /// Only used by the ariadne renderer (annotate-snippets has no OSC 8 support).
+    #[cfg(all(feature = "ariadne", not(target_family = "wasm")))]
     fn wrap_path_with_hyperlink(
         path: &str,
         has_disk_file: bool,
@@ -623,7 +750,7 @@ impl DiagnosticMessage {
 
     /// WASM version: hyperlinks don't make sense in WASM environments (no file system).
     /// Just return the path unmodified.
-    #[cfg(target_family = "wasm")]
+    #[cfg(all(feature = "ariadne", target_family = "wasm"))]
     fn wrap_path_with_hyperlink(
         path: &str,
         _has_disk_file: bool,
@@ -638,6 +765,7 @@ impl DiagnosticMessage {
     ///
     /// This produces the visual source code snippet with highlighting.
     /// The tidyverse-style problem/details/hints are added separately by to_text().
+    #[cfg(feature = "ariadne")]
     fn render_ariadne_source_context(
         &self,
         main_location: &quarto_source_map::SourceInfo,
@@ -822,6 +950,124 @@ impl DiagnosticMessage {
         }
     }
 
+    /// Render source context using [`annotate-snippets`](https://crates.io/crates/annotate-snippets),
+    /// the rust-lang toolchain's diagnostic style (private helper for to_text).
+    ///
+    /// Mirrors [`Self::render_ariadne_source_context`]'s offset-mapping
+    /// logic but emits the `error[CODE]: …` / `-->` / gutter-bar look.
+    /// Differences from the ariadne path, by design:
+    ///
+    /// - The error code is rendered natively via `Title::id` (e.g.
+    ///   `error[Q-2-5]: …`) rather than prefixed into the message.
+    /// - There are **no terminal hyperlinks** — annotate-snippets has no
+    ///   OSC 8 support, so `_enable_hyperlinks` is ignored.
+    /// - Detail labels are all rendered as `Context` annotations
+    ///   (annotate-snippets has no per-label color), so the `DetailKind`
+    ///   color distinction and the `Faded` blend are not reproduced.
+    /// - Empty-content "padding" details (an ariadne workaround for
+    ///   mid-span line elision) are skipped: annotate-snippets folds
+    ///   unannotated lines natively, which is the look we want here.
+    #[cfg(feature = "annotate-snippets")]
+    fn render_annotate_snippets_source_context(
+        &self,
+        main_location: &quarto_source_map::SourceInfo,
+        ctx: &quarto_source_map::SourceContext,
+        _enable_hyperlinks: bool,
+    ) -> Option<String> {
+        use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
+
+        // Resolve the root file and its content (same as the ariadne path).
+        let file_id = main_location.root_file_id()?;
+        let file = ctx.get_file(file_id)?;
+        let content = match &file.content {
+            Some(c) => c.clone(),
+            None => std::fs::read_to_string(&file.path).ok()?,
+        };
+        let content_len = content.len();
+
+        // Clamp a mapped byte range into the source, keeping start <= end.
+        let clamp = |start: usize, end: usize| -> std::ops::Range<usize> {
+            let s = start.min(content_len);
+            let e = end.min(content_len).max(s);
+            s..e
+        };
+
+        // Map the main location's offsets back to original-file byte
+        // positions, clamping the end past EOF like the ariadne path.
+        let start_mapped = main_location.map_offset(0, ctx)?;
+        let end_mapped = main_location
+            .map_offset(main_location.length(), ctx)
+            .or_else(|| {
+                if main_location.length() > 0 {
+                    main_location.map_offset(main_location.length() - 1, ctx)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| start_mapped.clone());
+        let main_span = clamp(start_mapped.location.offset, end_mapped.location.offset);
+
+        let level = match self.kind {
+            DiagnosticKind::Error => Level::ERROR,
+            DiagnosticKind::Warning => Level::WARNING,
+            DiagnosticKind::Info => Level::INFO,
+            DiagnosticKind::Note => Level::NOTE,
+        };
+
+        // Primary label message: the problem statement, else the title.
+        let main_message = match &self.problem {
+            Some(problem) => problem.as_str(),
+            None => self.title.as_str(),
+        };
+
+        let mut snippet = Snippet::source(content.as_str())
+            .path(file.path.as_str())
+            .line_start(1)
+            .annotation(AnnotationKind::Primary.span(main_span).label(main_message));
+
+        // Detail locations in the same file become Context annotations.
+        for detail in &self.details {
+            // Skip empty-content padding details (see the doc comment).
+            if detail.content.as_str().is_empty() {
+                continue;
+            }
+            let Some(detail_loc) = &detail.location else {
+                continue;
+            };
+            if detail_loc.root_file_id() != Some(file_id) {
+                continue;
+            }
+            if let (Some(detail_start), Some(detail_end)) = (
+                detail_loc.map_offset(0, ctx),
+                detail_loc.map_offset(detail_loc.length(), ctx),
+            ) {
+                let detail_span = clamp(detail_start.location.offset, detail_end.location.offset);
+                snippet = snippet.annotation(
+                    AnnotationKind::Context
+                        .span(detail_span)
+                        .label(detail.content.as_str()),
+                );
+            }
+        }
+
+        // Build the titled group; render the error code natively via `id`.
+        let mut title = level.primary_title(self.title.as_str());
+        if let Some(code) = &self.code {
+            title = title.id(code.as_str());
+        }
+        let group = title.element(snippet);
+
+        // `Renderer::render` returns text with no trailing newline, but
+        // `to_text` appends unlocated details and hints directly after the
+        // excerpt with `writeln!`. Match the ariadne path (which ends in a
+        // newline) so those lines don't glue onto the last source row.
+        let mut rendered = Renderer::styled().render(&[group]);
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        Some(rendered)
+    }
+
     /// Extend OSC 8 hyperlinks to include the :line:column suffix that ariadne adds.
     ///
     /// Ariadne formats file references as `path:line:column`, but since we wrap the path
@@ -830,6 +1076,7 @@ impl DiagnosticMessage {
     ///
     /// This function finds patterns like `path]8;;\:line:column` and moves the hyperlink
     /// end marker to after the line:column part.
+    #[cfg(feature = "ariadne")]
     fn extend_hyperlink_to_include_line_column(output: &str, original_path: &str) -> String {
         // Pattern: original_path followed by ]8;;\ then :numbers:numbers
         // We want to move the ]8;;\ to after the :numbers:numbers part
@@ -858,6 +1105,7 @@ impl DiagnosticMessage {
 
     /// Find the end position of a :line:column pattern at the start of the string.
     /// Returns None if the pattern doesn't match.
+    #[cfg(feature = "ariadne")]
     fn find_line_column_end(s: &str) -> Option<usize> {
         let bytes = s.as_bytes();
         if bytes.is_empty() || bytes[0] != b':' {
@@ -1187,5 +1435,106 @@ mod tests {
         assert!(text.contains("Something went wrong"));
         assert!(text.contains("Detail 1"));
         assert!(text.contains("Try this"));
+    }
+
+    /// Strip CSI SGR color sequences (`ESC [ … m`). The annotate-snippets
+    /// path emits no OSC 8 hyperlinks, so color is all we need to remove
+    /// to make substring assertions robust to styling.
+    #[cfg(feature = "annotate-snippets")]
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for n in chars.by_ref() {
+                    if n == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The annotate-snippets renderer emits the rust-lang toolchain look:
+    /// an `error[CODE]: …` header, a `-->` origin line, and `^` underlines
+    /// — not ariadne's enclosing box.
+    #[cfg(feature = "annotate-snippets")]
+    #[test]
+    fn annotate_snippets_renderer_produces_rust_style_output() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let file_id = ctx.add_file(
+            "test.qmd".to_string(),
+            Some("line 1\nline 2\nline 3".to_string()),
+        );
+        // Offsets 7..13 cover "line 2" on row 2.
+        let location = quarto_source_map::SourceInfo::original(file_id, 7, 13);
+        let msg = DiagnosticMessageBuilder::error("Bad thing")
+            .with_code("Q-9-9")
+            .with_location(location)
+            .problem("this is wrong")
+            .build();
+
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let raw =
+            msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::AnnotateSnippets));
+        let text = strip_ansi(&raw);
+
+        assert!(
+            text.contains("error[Q-9-9]"),
+            "expected rust-style code header; got: {text:?}"
+        );
+        assert!(
+            text.contains("-->"),
+            "expected rust-style origin arrow; got: {text:?}"
+        );
+        assert!(
+            text.contains("test.qmd:2:1"),
+            "expected mapped location; got: {text:?}"
+        );
+        assert!(
+            !text.contains('\u{256D}'),
+            "annotate-snippets must not draw ariadne's box corner; got: {text:?}"
+        );
+        // No OSC 8 hyperlinks from annotate-snippets.
+        assert!(
+            !raw.contains("\u{1b}]8;"),
+            "annotate-snippets emits no OSC 8 hyperlinks; got: {raw:?}"
+        );
+    }
+
+    /// Forcing a specific renderer is honored: ariadne draws its boxed
+    /// excerpt (the U+256D corner) while annotate-snippets does not.
+    #[cfg(all(feature = "ariadne", feature = "annotate-snippets"))]
+    #[test]
+    fn renderer_selection_switches_styles() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let file_id = ctx.add_file("a.qmd".to_string(), Some("alpha\nbeta\ngamma".to_string()));
+        let location = quarto_source_map::SourceInfo::original(file_id, 6, 10); // "beta"
+        let msg = DiagnosticMessageBuilder::error("Pick a style")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+
+        let ariadne = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
+        let snippets =
+            msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::AnnotateSnippets));
+
+        assert!(ariadne.contains('\u{256D}'), "ariadne draws a box corner");
+        assert!(
+            !strip_ansi(&snippets).contains('\u{256D}'),
+            "annotate-snippets does not"
+        );
+        assert!(strip_ansi(&snippets).contains("-->"));
     }
 }
