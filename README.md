@@ -1,5 +1,7 @@
 # quarto-error-reporting
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/posit-dev/quarto-error-reporting)
+
 Structured, source-aware diagnostics with a **pluggable error-code catalog**.
 
 This crate produces compiler-quality diagnostics — a title, a problem statement,
