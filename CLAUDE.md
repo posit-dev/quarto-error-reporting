@@ -176,3 +176,14 @@ snapshot is **backup-only and strictly one-directional**:
   snapshot on one branch showing strand state created on another — is expected
   and fine, because the snapshot is not the truth.)
 - The snapshot lives on whatever work branch you're on; it is not special.
+
+## Releasing
+
+Releases are made by merging a version-bump PR: bump `version` in the root
+`Cargo.toml`, open a PR, merge. CI (`.github/workflows/release.yml`) then
+tests at the release commit, publishes to crates.io via [Trusted
+Publishing](https://crates.io/docs/trusted-publishing), tags `vX.Y.Z`, and
+creates a GitHub Release. Pushes that don't change the version never
+publish. A failed release run is safe to re-run (already-published steps
+skip). To exercise the pipeline without releasing: Actions → Release → Run
+workflow with `dry_run`.
