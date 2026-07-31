@@ -21,6 +21,32 @@
 //! mixed-content representative) is low. We will widen the key to
 //! `(location, code)` if it turns out to bite.
 //!
+//! # File identity is the resolved path, not the raw `FileId`
+//!
+//! A raw `FileId` is only globally meaningful when it is hash-based
+//! (path-derived, e.g. `quarto_yaml::file_id_for_filename`).
+//! Sequential per-context ids are not: every document's primary file
+//! is `FileId(0)` in its own [`SourceContext`], so keying on the raw
+//! id would falsely merge diagnostics from different files that
+//! happen to sit at identical byte offsets.
+//!
+//! Each input entry carries its own `Option<SourceContext>`, so the
+//! group key resolves the file component through it: if the
+//! location's `FileId` is registered in the entry's context, the key
+//! is the registered file **path**; otherwise it falls back to the
+//! raw id (hash-based ids that aren't registered in per-document
+//! contexts stay stable and collision-safe). The two key flavors
+//! never compare equal to each other.
+//!
+//! Both fallback edges fail toward *splitting* groups, never toward
+//! false merges:
+//!
+//! - paths are compared verbatim (no canonicalization), so two
+//!   contexts registering the same file under different spellings
+//!   (`./_quarto.yml` vs `_quarto.yml`) form two groups;
+//! - the same id resolving in one entry's context but not another's
+//!   (e.g. one entry has no context at all) forms two groups.
+//!
 //! # What does not coalesce
 //!
 //! Diagnostics whose `location` is one of:
@@ -41,7 +67,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use quarto_source_map::{SourceContext, SourceInfo};
+use quarto_source_map::{FileId, SourceContext, SourceInfo};
 
 use crate::diagnostic::{DiagnosticMessage, TextRenderOptions};
 
@@ -110,26 +136,43 @@ fn render_affected_files_tail(paths: &[PathBuf]) -> String {
     }
 }
 
+/// File component of a [`LocationKey`].
+///
+/// The two variants never compare equal to each other, so an entry
+/// whose id resolves through its context can never collide with one
+/// whose id doesn't.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FileKey {
+    /// The location's `FileId` resolved to a file registered in the
+    /// entry's own `SourceContext`; identity is the registered path.
+    Path(String),
+    /// Unresolvable id — the entry has no context, or the id isn't
+    /// registered in it. Raw ids are only collision-safe when they
+    /// are hash-based (see module docs).
+    Raw(usize),
+}
+
 /// Canonical, hashable form of a [`SourceInfo`] for grouping.
 ///
-/// Resolves to the root `Original`'s `(file_id, start_offset,
-/// end_offset)` tuple. Returns `None` for shapes that don't reduce
-/// cleanly (mirrors [`SourceInfo::resolve_byte_range`]).
+/// Resolves to the root `Original`'s byte range, with the file
+/// component resolved through the entry's own `SourceContext` (see
+/// [`FileKey`]). Returns `None` for shapes that don't reduce cleanly
+/// (mirrors [`SourceInfo::resolve_byte_range`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct LocationKey {
-    file_id: usize,
+    file: FileKey,
     start: usize,
     end: usize,
 }
 
 impl LocationKey {
-    fn from(info: &SourceInfo) -> Option<Self> {
+    fn from(info: &SourceInfo, ctx: Option<&SourceContext>) -> Option<Self> {
         let (file_id, start, end) = info.resolve_byte_range()?;
-        Some(LocationKey {
-            file_id,
-            start,
-            end,
-        })
+        let file = match ctx.and_then(|c| c.get_file(FileId(file_id))) {
+            Some(f) => FileKey::Path(f.path.clone()),
+            None => FileKey::Raw(file_id),
+        };
+        Some(LocationKey { file, start, end })
     }
 }
 
@@ -153,7 +196,10 @@ where
     let mut index: HashMap<LocationKey, usize> = HashMap::new();
 
     for (path, diagnostic, source_context) in input {
-        let key = diagnostic.location.as_ref().and_then(LocationKey::from);
+        let key = diagnostic
+            .location
+            .as_ref()
+            .and_then(|loc| LocationKey::from(loc, source_context.as_ref()));
         match key {
             Some(k) => match index.get(&k).copied() {
                 Some(idx) => {
@@ -346,11 +392,13 @@ mod tests {
         // The representative is the *first* (path, diagnostic) seen
         // for a given key. Later contributions only add to
         // `affected_files`. The same goes for the SourceContext.
+        // Both contexts register the same path for FileId(1), so the
+        // entries key identically and merge.
         let loc = original(1, 100, 110);
         let mut ctx_first = SourceContext::new();
-        ctx_first.add_file_with_id(FileId(1), "first.yml".into(), Some("first".into()));
+        ctx_first.add_file_with_id(FileId(1), "config.yml".into(), Some("first".into()));
         let mut ctx_second = SourceContext::new();
-        ctx_second.add_file_with_id(FileId(1), "second.yml".into(), Some("second".into()));
+        ctx_second.add_file_with_id(FileId(1), "config.yml".into(), Some("second".into()));
 
         let input = vec![
             (
@@ -367,7 +415,103 @@ mod tests {
         let groups = coalesce_by_source(input);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].representative.title, "first");
-        assert!(groups[0].source_context.is_some());
+        let kept = groups[0].source_context.as_ref().expect("context kept");
+        assert_eq!(
+            kept.get_file(FileId(1)).unwrap().content.as_deref(),
+            Some("first"),
+            "the group must keep the first entry's SourceContext"
+        );
+    }
+
+    #[test]
+    fn hash_based_id_with_same_path_collapses_across_contexts() {
+        // Hash-based ids are registered per-document, but every
+        // document's context maps them to the same path — entries
+        // must merge into one group in encounter order.
+        let hash_id = 0xdeadbeef_usize;
+        let loc = original(hash_id, 40, 50);
+        let names = ["a", "b", "c"];
+        let input: Vec<_> = names
+            .iter()
+            .map(|n| {
+                let mut ctx = SourceContext::new();
+                ctx.add_file_with_id(
+                    FileId(hash_id),
+                    "_quarto.yml".into(),
+                    Some("theme: nope".into()),
+                );
+                (
+                    PathBuf::from(format!("{n}.qmd")),
+                    diag_at(loc.clone(), "T"),
+                    Some(ctx),
+                )
+            })
+            .collect();
+        let groups = coalesce_by_source(input);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].affected_files,
+            vec![
+                PathBuf::from("a.qmd"),
+                PathBuf::from("b.qmd"),
+                PathBuf::from("c.qmd"),
+            ]
+        );
+    }
+
+    #[test]
+    fn sequential_id_collision_across_contexts_does_not_collapse() {
+        // Regression test for GH #3: every document's primary file is
+        // FileId(0) in its own SourceContext. Identical byte offsets
+        // in *different* files must not merge.
+        let loc = original(0, 10, 20);
+        let mut ctx_a = SourceContext::new();
+        assert_eq!(
+            ctx_a.add_file("a.qmd".into(), Some("contents a".into())),
+            FileId(0)
+        );
+        let mut ctx_b = SourceContext::new();
+        assert_eq!(
+            ctx_b.add_file("b.qmd".into(), Some("contents b".into())),
+            FileId(0)
+        );
+
+        let input = vec![
+            (
+                PathBuf::from("a.qmd"),
+                diag_at(loc.clone(), "in a"),
+                Some(ctx_a),
+            ),
+            (
+                PathBuf::from("b.qmd"),
+                diag_at(loc.clone(), "in b"),
+                Some(ctx_b),
+            ),
+        ];
+        let groups = coalesce_by_source(input);
+        assert_eq!(groups.len(), 2, "FileId(0) in two contexts is two files");
+        assert_eq!(groups[0].representative.title, "in a");
+        assert_eq!(groups[0].affected_files, vec![PathBuf::from("a.qmd")]);
+        assert_eq!(groups[1].representative.title, "in b");
+        assert_eq!(groups[1].affected_files, vec![PathBuf::from("b.qmd")]);
+    }
+
+    #[test]
+    fn resolvable_and_unresolvable_same_raw_id_do_not_collapse() {
+        // Accepted split-not-merge edge (module docs): the same raw
+        // id keys as Path in an entry whose context registers it and
+        // as Raw in an entry without a context. Path and Raw keys
+        // never compare equal, so the entries split.
+        let loc = original(7, 10, 20);
+        let mut ctx = SourceContext::new();
+        ctx.add_file_with_id(FileId(7), "seven.yml".into(), Some("s".into()));
+
+        let input = vec![
+            (PathBuf::from("a.qmd"), diag_at(loc.clone(), "T"), Some(ctx)),
+            (PathBuf::from("b.qmd"), diag_at(loc.clone(), "T"), None),
+        ];
+        let groups = coalesce_by_source(input);
+        assert_eq!(groups.len(), 2);
     }
 
     #[test]
