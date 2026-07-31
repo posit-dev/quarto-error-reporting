@@ -95,8 +95,9 @@ public signature of `coalesce_by_source` is unchanged.
         entry's (by content marker).
 - [x] `cargo xtask verify` (fmt, clippy, build, tests across feature sets)
       — all 6 checks green.
-- [ ] Branch + PR referencing GH #3 (`Fixes #3`), strand qe-kjherkvf in
-      the body. Branch: `fix/coalesce-path-aware-key`.
+- [x] Branch + PR referencing GH #3 (`Fixes #3`), strand qe-kjherkvf in
+      the body. Branch: `fix/coalesce-path-aware-key`, PR:
+      https://github.com/posit-dev/quarto-error-reporting/pull/4.
 - [ ] After merge: comment on/close strand qe-kjherkvf; confirm the
       release workflow published 0.2.1.
 
