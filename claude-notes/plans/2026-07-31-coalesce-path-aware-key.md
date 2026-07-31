@@ -98,8 +98,13 @@ public signature of `coalesce_by_source` is unchanged.
 - [x] Branch + PR referencing GH #3 (`Fixes #3`), strand qe-kjherkvf in
       the body. Branch: `fix/coalesce-path-aware-key`, PR:
       https://github.com/posit-dev/quarto-error-reporting/pull/4.
-- [ ] After merge: comment on/close strand qe-kjherkvf; confirm the
-      release workflow published 0.2.1.
+- [x] After merge: comment on/close strand qe-kjherkvf; confirm the
+      release workflow published 0.2.1. PR #4 merged 2026-07-31;
+      release run succeeded — tag `v0.2.1`, GitHub Release published,
+      crates.io shows 0.2.1. GH #3 auto-closed by the merge.
+
+Plan complete. Follow-on work (q2 bumping its pin and routing per-page
+diagnostics through the coalescer) lives in q2's tracker (bd-mg3ckvp7).
 
 ## Release (decided)
 
