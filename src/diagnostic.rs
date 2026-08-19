@@ -651,6 +651,40 @@ impl DiagnosticMessage {
         obj
     }
 
+    /// Snap a mapped byte range onto UTF-8 character boundaries within
+    /// `content`, clamping it into the file and keeping `start <= end`.
+    ///
+    /// Both renderers slice the source by byte offset — ariadne in
+    /// `write.rs`, annotate-snippets in `renderer/source_map.rs` — and both
+    /// **panic** on an offset that falls inside a multi-byte character.
+    /// The offsets we hand them come from `SourceInfo` mappings, which are
+    /// not guaranteed to be boundary-aligned: a mapping that is off by a
+    /// byte is a cosmetic caret error on ASCII but a process abort next to
+    /// a multi-byte character. Printing a diagnostic must never be able to
+    /// kill a render, so we normalize here rather than trusting the input.
+    ///
+    /// The range is widened, not truncated: `start` floors to the start of
+    /// the character containing it and `end` ceils to the end of the
+    /// character containing it, so the highlight covers whole characters
+    /// and can never invert.
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+    fn snap_span_to_char_boundaries(
+        content: &str,
+        start: usize,
+        end: usize,
+    ) -> std::ops::Range<usize> {
+        let len = content.len();
+        let mut s = start.min(len);
+        let mut e = end.min(len).max(s);
+        while s > 0 && !content.is_char_boundary(s) {
+            s -= 1;
+        }
+        while e < len && !content.is_char_boundary(e) {
+            e += 1;
+        }
+        s..e
+    }
+
     /// Dispatch to the selected source-context renderer.
     ///
     /// `renderer` of `None` resolves to [`SourceRenderer::default_for_features`].
@@ -839,14 +873,19 @@ impl DiagnosticMessage {
             DiagnosticKind::Note => (ReportKind::Advice, Color::Blue),
         };
 
+        // Snap once, up front: every offset handed to ariadne below (the
+        // report anchor and the main label) must be char-boundary safe.
+        let main_span = Self::snap_span_to_char_boundaries(
+            &content,
+            start_mapped.location.offset,
+            end_mapped.location.offset,
+        );
+
         // Build the report using the mapped offset for proper line:column display
         // IMPORTANT: Use IndexType::Byte because our offsets are byte offsets, not character offsets
         let mut report = Report::build(
             report_kind,
-            (
-                display_path.clone(),
-                start_mapped.location.offset..start_mapped.location.offset,
-            ),
+            (display_path.clone(), main_span.start..main_span.start),
         )
         .with_config(Config::default().with_index_type(IndexType::Byte));
 
@@ -857,8 +896,7 @@ impl DiagnosticMessage {
             report = report.with_message(&self.title);
         }
 
-        // Add main location label using mapped offsets
-        let main_span = start_mapped.location.offset..end_mapped.location.offset;
+        // Add main location label using the snapped span computed above.
         let main_message = if let Some(problem) = &self.problem {
             problem.as_str()
         } else {
@@ -896,7 +934,11 @@ impl DiagnosticMessage {
                         detail_loc.map_offset(0, ctx),
                         detail_loc.map_offset(detail_loc.length(), ctx),
                     ) {
-                        let detail_span = detail_start.location.offset..detail_end.location.offset;
+                        let detail_span = Self::snap_span_to_char_boundaries(
+                            &content,
+                            detail_start.location.offset,
+                            detail_end.location.offset,
+                        );
                         let detail_color = match detail.kind {
                             DetailKind::Error => Color::Red,
                             DetailKind::Info => Color::Cyan,
@@ -983,13 +1025,11 @@ impl DiagnosticMessage {
             Some(c) => c.clone(),
             None => std::fs::read_to_string(&file.path).ok()?,
         };
-        let content_len = content.len();
-
-        // Clamp a mapped byte range into the source, keeping start <= end.
+        // Clamp a mapped byte range into the source, keeping start <= end
+        // and both ends on UTF-8 character boundaries (annotate-snippets
+        // panics on a mid-character offset just as ariadne does).
         let clamp = |start: usize, end: usize| -> std::ops::Range<usize> {
-            let s = start.min(content_len);
-            let e = end.min(content_len).max(s);
-            s..e
+            Self::snap_span_to_char_boundaries(&content, start, end)
         };
 
         // Map the main location's offsets back to original-file byte
@@ -1506,6 +1546,115 @@ mod tests {
         assert!(
             !raw.contains("\u{1b}]8;"),
             "annotate-snippets emits no OSC 8 hyperlinks; got: {raw:?}"
+        );
+    }
+
+    /// Direct coverage of the snapping helper's contract: clamp into the
+    /// file, widen to whole characters, never invert.
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+    #[test]
+    fn snap_span_widens_to_whole_characters() {
+        // `\u{2728}` occupies bytes 3..6.
+        let content = "abc\u{2728}def";
+        assert_eq!(content.len(), 9);
+
+        let snap = |s, e| DiagnosticMessage::snap_span_to_char_boundaries(content, s, e);
+
+        // Already aligned: unchanged.
+        assert_eq!(snap(0, 3), 0..3);
+        assert_eq!(snap(3, 6), 3..6);
+
+        // Start inside the char floors to its first byte; end inside it ceils
+        // to its last, so the highlight covers the whole character.
+        assert_eq!(snap(4, 9), 3..9);
+        assert_eq!(snap(5, 9), 3..9);
+        assert_eq!(snap(0, 4), 0..6);
+        assert_eq!(snap(0, 5), 0..6);
+        assert_eq!(snap(4, 5), 3..6);
+
+        // Past EOF clamps to the file length.
+        assert_eq!(snap(3, 999), 3..9);
+        assert_eq!(snap(999, 999), 9..9);
+
+        // Inverted input collapses to an empty range rather than inverting.
+        assert_eq!(snap(6, 3), 6..6);
+
+        // An empty range inside a character still snaps to a boundary.
+        let r = snap(4, 4);
+        assert!(content.is_char_boundary(r.start) && content.is_char_boundary(r.end));
+        assert!(r.start <= r.end);
+    }
+
+    /// A span whose **start** lands inside a multi-byte character must not
+    /// abort the process. Real spans arrive from `SourceInfo` mappings that
+    /// can be off by a byte (q2's YAML/config path shifts scalar spans one
+    /// byte left, onto the opening quote); when that shift lands mid-character
+    /// ariadne's line slicing panics with "byte index N is not a char
+    /// boundary". Printing a diagnostic must never be able to kill a render.
+    ///
+    /// Layout of the source below (byte offsets):
+    ///   `text: <span>Ask AI ` = 0..19, `\u{2728}` = 19..22, `</span>` = 22..29
+    /// so 21 is two bytes into the three-byte char — exactly the observed
+    /// off-by-one-left onto a multi-byte boundary.
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn ariadne_span_starting_inside_multibyte_char_does_not_panic() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let content = "text: <span>Ask AI \u{2728}</span>".to_string();
+        assert!(!content.is_char_boundary(21), "test fixture precondition");
+
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let file_id = ctx.add_file("_quarto.yml".to_string(), Some(content.clone()));
+        // 21..28 — start is mid-`\u{2728}`, mirroring the config-path shift.
+        let location = quarto_source_map::SourceInfo::original(file_id, 21, 28);
+        let msg = DiagnosticMessageBuilder::warning("HTML element converted to raw HTML")
+            .with_code("Q-2-9")
+            .with_location(location)
+            .build();
+
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
+
+        assert!(
+            text.contains("HTML element converted to raw HTML"),
+            "diagnostic must still render; got: {text:?}"
+        );
+        assert!(
+            text.contains("_quarto.yml"),
+            "source context must still render; got: {text:?}"
+        );
+    }
+
+    /// The same guarantee for the annotate-snippets renderer: its `clamp`
+    /// closure bounds offsets against EOF but not against char boundaries.
+    #[cfg(feature = "annotate-snippets")]
+    #[test]
+    fn annotate_snippets_span_starting_inside_multibyte_char_does_not_panic() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let content = "text: <span>Ask AI \u{2728}</span>".to_string();
+        assert!(!content.is_char_boundary(21), "test fixture precondition");
+
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let file_id = ctx.add_file("_quarto.yml".to_string(), Some(content.clone()));
+        let location = quarto_source_map::SourceInfo::original(file_id, 21, 28);
+        let msg = DiagnosticMessageBuilder::warning("HTML element converted to raw HTML")
+            .with_code("Q-2-9")
+            .with_location(location)
+            .build();
+
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text =
+            msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::AnnotateSnippets));
+
+        assert!(
+            text.contains("HTML element converted to raw HTML"),
+            "diagnostic must still render; got: {text:?}"
         );
     }
 
