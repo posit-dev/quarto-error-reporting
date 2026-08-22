@@ -651,6 +651,40 @@ impl DiagnosticMessage {
         obj
     }
 
+    /// Snap a mapped byte range onto UTF-8 character boundaries within
+    /// `content`, clamping it into the file and keeping `start <= end`.
+    ///
+    /// Both renderers slice the source by byte offset — ariadne in
+    /// `write.rs`, annotate-snippets in `renderer/source_map.rs` — and both
+    /// **panic** on an offset that falls inside a multi-byte character.
+    /// The offsets we hand them come from `SourceInfo` mappings, which are
+    /// not guaranteed to be boundary-aligned: a mapping that is off by a
+    /// byte is a cosmetic caret error on ASCII but a process abort next to
+    /// a multi-byte character. Printing a diagnostic must never be able to
+    /// kill a render, so we normalize here rather than trusting the input.
+    ///
+    /// The range is widened, not truncated: `start` floors to the start of
+    /// the character containing it and `end` ceils to the end of the
+    /// character containing it, so the highlight covers whole characters
+    /// and can never invert.
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+    fn snap_span_to_char_boundaries(
+        content: &str,
+        start: usize,
+        end: usize,
+    ) -> std::ops::Range<usize> {
+        let len = content.len();
+        let mut s = start.min(len);
+        let mut e = end.min(len).max(s);
+        while s > 0 && !content.is_char_boundary(s) {
+            s -= 1;
+        }
+        while e < len && !content.is_char_boundary(e) {
+            e += 1;
+        }
+        s..e
+    }
+
     /// Dispatch to the selected source-context renderer.
     ///
     /// `renderer` of `None` resolves to [`SourceRenderer::default_for_features`].
@@ -839,14 +873,19 @@ impl DiagnosticMessage {
             DiagnosticKind::Note => (ReportKind::Advice, Color::Blue),
         };
 
+        // Snap once, up front: every offset handed to ariadne below (the
+        // report anchor and the main label) must be char-boundary safe.
+        let main_span = Self::snap_span_to_char_boundaries(
+            &content,
+            start_mapped.location.offset,
+            end_mapped.location.offset,
+        );
+
         // Build the report using the mapped offset for proper line:column display
         // IMPORTANT: Use IndexType::Byte because our offsets are byte offsets, not character offsets
         let mut report = Report::build(
             report_kind,
-            (
-                display_path.clone(),
-                start_mapped.location.offset..start_mapped.location.offset,
-            ),
+            (display_path.clone(), main_span.start..main_span.start),
         )
         .with_config(Config::default().with_index_type(IndexType::Byte));
 
@@ -857,8 +896,7 @@ impl DiagnosticMessage {
             report = report.with_message(&self.title);
         }
 
-        // Add main location label using mapped offsets
-        let main_span = start_mapped.location.offset..end_mapped.location.offset;
+        // Add main location label using the snapped span computed above.
         let main_message = if let Some(problem) = &self.problem {
             problem.as_str()
         } else {
@@ -896,7 +934,11 @@ impl DiagnosticMessage {
                         detail_loc.map_offset(0, ctx),
                         detail_loc.map_offset(detail_loc.length(), ctx),
                     ) {
-                        let detail_span = detail_start.location.offset..detail_end.location.offset;
+                        let detail_span = Self::snap_span_to_char_boundaries(
+                            &content,
+                            detail_start.location.offset,
+                            detail_end.location.offset,
+                        );
                         let detail_color = match detail.kind {
                             DetailKind::Error => Color::Red,
                             DetailKind::Info => Color::Cyan,
@@ -983,13 +1025,11 @@ impl DiagnosticMessage {
             Some(c) => c.clone(),
             None => std::fs::read_to_string(&file.path).ok()?,
         };
-        let content_len = content.len();
-
-        // Clamp a mapped byte range into the source, keeping start <= end.
+        // Clamp a mapped byte range into the source, keeping start <= end
+        // and both ends on UTF-8 character boundaries (annotate-snippets
+        // panics on a mid-character offset just as ariadne does).
         let clamp = |start: usize, end: usize| -> std::ops::Range<usize> {
-            let s = start.min(content_len);
-            let e = end.min(content_len).max(s);
-            s..e
+            Self::snap_span_to_char_boundaries(&content, start, end)
         };
 
         // Map the main location's offsets back to original-file byte
@@ -1506,6 +1546,293 @@ mod tests {
         assert!(
             !raw.contains("\u{1b}]8;"),
             "annotate-snippets emits no OSC 8 hyperlinks; got: {raw:?}"
+        );
+    }
+
+    /// Direct coverage of the snapping helper's contract: clamp into the
+    /// file, widen to whole characters, never invert.
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+    #[test]
+    fn snap_span_widens_to_whole_characters() {
+        // `\u{2728}` occupies bytes 3..6.
+        let content = "abc\u{2728}def";
+        assert_eq!(content.len(), 9);
+
+        let snap = |s, e| DiagnosticMessage::snap_span_to_char_boundaries(content, s, e);
+
+        // Already aligned: unchanged.
+        assert_eq!(snap(0, 3), 0..3);
+        assert_eq!(snap(3, 6), 3..6);
+
+        // Start inside the char floors to its first byte; end inside it ceils
+        // to its last, so the highlight covers the whole character.
+        assert_eq!(snap(4, 9), 3..9);
+        assert_eq!(snap(5, 9), 3..9);
+        assert_eq!(snap(0, 4), 0..6);
+        assert_eq!(snap(0, 5), 0..6);
+        assert_eq!(snap(4, 5), 3..6);
+
+        // Past EOF clamps to the file length.
+        assert_eq!(snap(3, 999), 3..9);
+        assert_eq!(snap(999, 999), 9..9);
+
+        // Inverted input collapses to an empty range rather than inverting.
+        assert_eq!(snap(6, 3), 6..6);
+
+        // An empty range inside a character still snaps to a boundary.
+        let r = snap(4, 4);
+        assert!(content.is_char_boundary(r.start) && content.is_char_boundary(r.end));
+        assert!(r.start <= r.end);
+
+        // Second content block: the exact offset pair the two
+        // `..._does_not_panic` integration tests below use, now that the
+        // `quarto-source-map` 0.1.2+ floor makes 21 unreachable at their
+        // level (see those tests' doc comments). This is where that
+        // coverage now lives.
+        //
+        // Layout (byte offsets):
+        //   `text: <span>Ask AI ` = 0..19, `\u{2728}` = 19..22, `</span>` = 22..29
+        let content2 = "text: <span>Ask AI \u{2728}</span>";
+        assert!(!content2.is_char_boundary(21), "test fixture precondition");
+        let snap2 = |s, e| DiagnosticMessage::snap_span_to_char_boundaries(content2, s, e);
+
+        // 21 is mid-`\u{2728}` (bytes 19..22) and floors to 19; 28 is
+        // already on a boundary (inside the trailing ASCII `</span>`) and
+        // is left unchanged.
+        assert_eq!(snap2(21, 28), 19..28);
+    }
+
+    /// A diagnostic whose `SourceInfo` span originally lands mid-character
+    /// still renders end to end under the ariadne renderer.
+    ///
+    /// This test used to be the integration-level proof that
+    /// `snap_span_to_char_boundaries` prevents ariadne's mid-character
+    /// panic. It no longer is: `quarto-source-map` 0.1.2+ floors
+    /// `offset_to_location`'s returned offset to a UTF-8 character
+    /// boundary, so by the time `map_offset` hands this test's span
+    /// (21..28, with 21 mid-`\u{2728}`) to the renderer it has already
+    /// become 19..28 — the snap in this crate is never exercised against a
+    /// mid-character offset at this level, because one can no longer be
+    /// constructed here. The snap's actual coverage moved to
+    /// `snap_span_widens_to_whole_characters`'s second content block, which
+    /// calls it directly with these same offsets.
+    ///
+    /// **Accepted, not an oversight:** after the upstream floor, no revert
+    /// of this crate's own code (the snap helper or its three call sites)
+    /// can turn this test red — it is unbound with respect to this crate's
+    /// diff. That is known and accepted; the test stays as an end-to-end
+    /// smoke check that a span-carrying diagnostic renders successfully
+    /// under ariadne, not as a snap regression test.
+    ///
+    /// Layout of the source below (byte offsets):
+    ///   `text: <span>Ask AI ` = 0..19, `\u{2728}` = 19..22, `</span>` = 22..29
+    /// so 21 is two bytes into the three-byte char — exactly the observed
+    /// off-by-one-left onto a multi-byte boundary.
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn ariadne_renders_diagnostic_with_originally_mid_character_span() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let content = "text: <span>Ask AI \u{2728}</span>".to_string();
+        assert!(!content.is_char_boundary(21), "test fixture precondition");
+
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let file_id = ctx.add_file("_quarto.yml".to_string(), Some(content.clone()));
+        // 21..28 — start is mid-`\u{2728}`, mirroring the config-path shift.
+        let location = quarto_source_map::SourceInfo::original(file_id, 21, 28);
+        let msg = DiagnosticMessageBuilder::warning("HTML element converted to raw HTML")
+            .with_code("Q-2-9")
+            .with_location(location)
+            .build();
+
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
+
+        assert!(
+            text.contains("HTML element converted to raw HTML"),
+            "diagnostic must still render; got: {text:?}"
+        );
+        assert!(
+            text.contains("_quarto.yml"),
+            "source context must still render; got: {text:?}"
+        );
+    }
+
+    /// The same end-to-end smoke check as
+    /// `ariadne_renders_diagnostic_with_originally_mid_character_span`, for
+    /// the annotate-snippets renderer.
+    ///
+    /// It no longer exercises the mid-character path either, for the same
+    /// reason: `quarto-source-map` 0.1.2+'s floor in `offset_to_location`
+    /// means `map_offset` has already snapped this test's 21..28 span to
+    /// 19..28 before it reaches annotate-snippets' `clamp` closure, so the
+    /// closure never sees a mid-character offset from this call path. The
+    /// snap's real coverage lives in `snap_span_widens_to_whole_characters`'s
+    /// second content block (same 21..28 offsets, exercised directly).
+    ///
+    /// **Accepted, not an oversight:** as with the ariadne test above, no
+    /// revert of this crate's own snap logic can turn this test red after
+    /// the upstream floor — that unbinding is known and accepted.
+    #[cfg(feature = "annotate-snippets")]
+    #[test]
+    fn annotate_snippets_renders_diagnostic_with_originally_mid_character_span() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let content = "text: <span>Ask AI \u{2728}</span>".to_string();
+        assert!(!content.is_char_boundary(21), "test fixture precondition");
+
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let file_id = ctx.add_file("_quarto.yml".to_string(), Some(content.clone()));
+        let location = quarto_source_map::SourceInfo::original(file_id, 21, 28);
+        let msg = DiagnosticMessageBuilder::warning("HTML element converted to raw HTML")
+            .with_code("Q-2-9")
+            .with_location(location)
+            .build();
+
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text =
+            msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::AnnotateSnippets));
+
+        assert!(
+            text.contains("HTML element converted to raw HTML"),
+            "diagnostic must still render; got: {text:?}"
+        );
+    }
+
+    /// Strip CSI SGR color sequences, for tests gated under a single
+    /// renderer feature that can't rely on `strip_ansi` above (which is
+    /// gated on `annotate-snippets` only — ariadne colorizes its source
+    /// line and marker row too, so an ariadne-only test needs the same
+    /// stripping without pulling in that feature). Same logic as
+    /// `strip_ansi`, duplicated rather than re-gated so as not to touch
+    /// the existing helper.
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+    fn strip_ansi_colors(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for n in chars.by_ref() {
+                    if n == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// Measures the *rendered* width of a label whose mapped span is
+    /// genuinely zero-width, under the ariadne renderer.
+    ///
+    /// `\u{2728}` occupies bytes 6..9 of the content below; the input span
+    /// `SourceInfo::original(fid, 7, 8)` has **both ends** strictly inside
+    /// that character (unlike the `..._does_not_panic` tests above, whose
+    /// span only *starts* mid-character). Before the `quarto-source-map`
+    /// 0.1.2+ floor, `map_offset` passed the raw offsets 7 and 8 through
+    /// unchanged and this crate's own snap widened them to the whole
+    /// character (6..9). After the floor, `offset_to_location` already
+    /// floors both 7 and 8 down to 6 before this crate ever sees them, so
+    /// both mapped offsets are 6 — the snap runs on `6..6`, which is
+    /// already boundary-aligned, and has nothing left to widen. The
+    /// highlight that reaches the renderer is therefore zero-width, not
+    /// the whole character.
+    ///
+    /// ariadne's `Report::build` anchor is already `start..start`, so "a
+    /// zero-width label probably renders fine" was a reasonable guess
+    /// before this test — turning that guess into a measurement is the
+    /// point here. The assertion is keyed on the renderer's own
+    /// zero-width-vs-one-character marker *shape* (a bare `│` vs. `┬─`),
+    /// not merely on the message text appearing, so it fails if the
+    /// highlight ever widens back to covering the whole character.
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn ariadne_zero_width_label_renders_a_bare_marker() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let content = "x = 'A\u{2728}B'".to_string();
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let file_id = ctx.add_file("scratch.qmd".to_string(), Some(content.clone()));
+        let location = quarto_source_map::SourceInfo::original(file_id, 7, 8);
+        let msg = DiagnosticMessageBuilder::warning("scratch")
+            .with_code("Q-2-9")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
+        let stripped = strip_ansi_colors(&text);
+
+        let lines: Vec<&str> = stripped.lines().collect();
+        let source_idx = lines
+            .iter()
+            .position(|l| l.contains("x = 'A\u{2728}B'"))
+            .unwrap_or_else(|| panic!("source line must render; got: {stripped:?}"));
+        let marker_line = lines[source_idx + 1];
+        // Skip past the gutter's own `│` (present on every row, e.g.
+        // `   │       │  `) to isolate the marker glyphs themselves.
+        let gutter_end = marker_line
+            .find('│')
+            .map(|i| i + '│'.len_utf8())
+            .unwrap_or_else(|| panic!("marker row must have a gutter `│`; got: {marker_line:?}"));
+        let marker = marker_line[gutter_end..].trim();
+
+        assert_eq!(
+            marker, "│",
+            "expected the zero-width `│` marker (a whole-character label \
+             would instead draw `┬─`); got {marker:?} in:\n{stripped}"
+        );
+    }
+
+    /// The same measurement as `ariadne_zero_width_label_renders_a_bare_marker`,
+    /// for the annotate-snippets renderer. See that test's doc comment for
+    /// why both ends of `SourceInfo::original(fid, 7, 8)` land on the same
+    /// mapped offset (6) after the `quarto-source-map` 0.1.2+ floor.
+    ///
+    /// annotate-snippets underlines a span with one `^` per byte of width,
+    /// so the discriminating measurement here is even more direct than
+    /// ariadne's marker shape: a zero-width label draws exactly one `^`,
+    /// a whole-character label draws two (`^^`).
+    #[cfg(feature = "annotate-snippets")]
+    #[test]
+    fn annotate_snippets_zero_width_label_renders_a_single_caret() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let content = "x = 'A\u{2728}B'".to_string();
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let file_id = ctx.add_file("scratch.qmd".to_string(), Some(content.clone()));
+        let location = quarto_source_map::SourceInfo::original(file_id, 7, 8);
+        let msg = DiagnosticMessageBuilder::warning("scratch")
+            .with_code("Q-2-9")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text =
+            msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::AnnotateSnippets));
+        let stripped = strip_ansi_colors(&text);
+
+        let lines: Vec<&str> = stripped.lines().collect();
+        let source_idx = lines
+            .iter()
+            .position(|l| l.contains("x = 'A\u{2728}B'"))
+            .unwrap_or_else(|| panic!("source line must render; got: {stripped:?}"));
+        let marker_line = lines[source_idx + 1];
+        let caret_run: String = marker_line.chars().filter(|&c| c == '^').collect();
+
+        assert_eq!(
+            caret_run, "^",
+            "expected a single `^` caret marking a zero-width label (a \
+             whole-character label would instead draw `^^`); got \
+             {caret_run:?} in line: {marker_line:?}"
         );
     }
 
