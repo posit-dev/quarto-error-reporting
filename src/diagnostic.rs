@@ -1583,14 +1583,46 @@ mod tests {
         let r = snap(4, 4);
         assert!(content.is_char_boundary(r.start) && content.is_char_boundary(r.end));
         assert!(r.start <= r.end);
+
+        // Second content block: the exact offset pair the two
+        // `..._does_not_panic` integration tests below use, now that the
+        // `quarto-source-map` 0.1.2+ floor makes 21 unreachable at their
+        // level (see those tests' doc comments). This is where that
+        // coverage now lives.
+        //
+        // Layout (byte offsets):
+        //   `text: <span>Ask AI ` = 0..19, `\u{2728}` = 19..22, `</span>` = 22..29
+        let content2 = "text: <span>Ask AI \u{2728}</span>";
+        assert!(!content2.is_char_boundary(21), "test fixture precondition");
+        let snap2 = |s, e| DiagnosticMessage::snap_span_to_char_boundaries(content2, s, e);
+
+        // 21 is mid-`\u{2728}` (bytes 19..22) and floors to 19; 28 is
+        // already on a boundary (inside the trailing ASCII `</span>`) and
+        // is left unchanged.
+        assert_eq!(snap2(21, 28), 19..28);
     }
 
-    /// A span whose **start** lands inside a multi-byte character must not
-    /// abort the process. Real spans arrive from `SourceInfo` mappings that
-    /// can be off by a byte (q2's YAML/config path shifts scalar spans one
-    /// byte left, onto the opening quote); when that shift lands mid-character
-    /// ariadne's line slicing panics with "byte index N is not a char
-    /// boundary". Printing a diagnostic must never be able to kill a render.
+    /// A diagnostic whose `SourceInfo` span originally lands mid-character
+    /// still renders end to end under the ariadne renderer.
+    ///
+    /// This test used to be the integration-level proof that
+    /// `snap_span_to_char_boundaries` prevents ariadne's mid-character
+    /// panic. It no longer is: `quarto-source-map` 0.1.2+ floors
+    /// `offset_to_location`'s returned offset to a UTF-8 character
+    /// boundary, so by the time `map_offset` hands this test's span
+    /// (21..28, with 21 mid-`\u{2728}`) to the renderer it has already
+    /// become 19..28 — the snap in this crate is never exercised against a
+    /// mid-character offset at this level, because one can no longer be
+    /// constructed here. The snap's actual coverage moved to
+    /// `snap_span_widens_to_whole_characters`'s second content block, which
+    /// calls it directly with these same offsets.
+    ///
+    /// **Accepted, not an oversight:** after the upstream floor, no revert
+    /// of this crate's own code (the snap helper or its three call sites)
+    /// can turn this test red — it is unbound with respect to this crate's
+    /// diff. That is known and accepted; the test stays as an end-to-end
+    /// smoke check that a span-carrying diagnostic renders successfully
+    /// under ariadne, not as a snap regression test.
     ///
     /// Layout of the source below (byte offsets):
     ///   `text: <span>Ask AI ` = 0..19, `\u{2728}` = 19..22, `</span>` = 22..29
@@ -1598,7 +1630,7 @@ mod tests {
     /// off-by-one-left onto a multi-byte boundary.
     #[cfg(feature = "ariadne")]
     #[test]
-    fn ariadne_span_starting_inside_multibyte_char_does_not_panic() {
+    fn ariadne_renders_diagnostic_with_originally_mid_character_span() {
         use crate::builder::DiagnosticMessageBuilder;
 
         let content = "text: <span>Ask AI \u{2728}</span>".to_string();
@@ -1628,11 +1660,24 @@ mod tests {
         );
     }
 
-    /// The same guarantee for the annotate-snippets renderer: its `clamp`
-    /// closure bounds offsets against EOF but not against char boundaries.
+    /// The same end-to-end smoke check as
+    /// `ariadne_renders_diagnostic_with_originally_mid_character_span`, for
+    /// the annotate-snippets renderer.
+    ///
+    /// It no longer exercises the mid-character path either, for the same
+    /// reason: `quarto-source-map` 0.1.2+'s floor in `offset_to_location`
+    /// means `map_offset` has already snapped this test's 21..28 span to
+    /// 19..28 before it reaches annotate-snippets' `clamp` closure, so the
+    /// closure never sees a mid-character offset from this call path. The
+    /// snap's real coverage lives in `snap_span_widens_to_whole_characters`'s
+    /// second content block (same 21..28 offsets, exercised directly).
+    ///
+    /// **Accepted, not an oversight:** as with the ariadne test above, no
+    /// revert of this crate's own snap logic can turn this test red after
+    /// the upstream floor — that unbinding is known and accepted.
     #[cfg(feature = "annotate-snippets")]
     #[test]
-    fn annotate_snippets_span_starting_inside_multibyte_char_does_not_panic() {
+    fn annotate_snippets_renders_diagnostic_with_originally_mid_character_span() {
         use crate::builder::DiagnosticMessageBuilder;
 
         let content = "text: <span>Ask AI \u{2728}</span>".to_string();
