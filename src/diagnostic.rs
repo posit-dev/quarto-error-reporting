@@ -1703,6 +1703,139 @@ mod tests {
         );
     }
 
+    /// Strip CSI SGR color sequences, for tests gated under a single
+    /// renderer feature that can't rely on `strip_ansi` above (which is
+    /// gated on `annotate-snippets` only — ariadne colorizes its source
+    /// line and marker row too, so an ariadne-only test needs the same
+    /// stripping without pulling in that feature). Same logic as
+    /// `strip_ansi`, duplicated rather than re-gated so as not to touch
+    /// the existing helper.
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+    fn strip_ansi_colors(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for n in chars.by_ref() {
+                    if n == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// Measures the *rendered* width of a label whose mapped span is
+    /// genuinely zero-width, under the ariadne renderer.
+    ///
+    /// `\u{2728}` occupies bytes 6..9 of the content below; the input span
+    /// `SourceInfo::original(fid, 7, 8)` has **both ends** strictly inside
+    /// that character (unlike the `..._does_not_panic` tests above, whose
+    /// span only *starts* mid-character). Before the `quarto-source-map`
+    /// 0.1.2+ floor, `map_offset` passed the raw offsets 7 and 8 through
+    /// unchanged and this crate's own snap widened them to the whole
+    /// character (6..9). After the floor, `offset_to_location` already
+    /// floors both 7 and 8 down to 6 before this crate ever sees them, so
+    /// both mapped offsets are 6 — the snap runs on `6..6`, which is
+    /// already boundary-aligned, and has nothing left to widen. The
+    /// highlight that reaches the renderer is therefore zero-width, not
+    /// the whole character.
+    ///
+    /// ariadne's `Report::build` anchor is already `start..start`, so "a
+    /// zero-width label probably renders fine" was a reasonable guess
+    /// before this test — turning that guess into a measurement is the
+    /// point here. The assertion is keyed on the renderer's own
+    /// zero-width-vs-one-character marker *shape* (a bare `│` vs. `┬─`),
+    /// not merely on the message text appearing, so it fails if the
+    /// highlight ever widens back to covering the whole character.
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn ariadne_zero_width_label_renders_a_bare_marker() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let content = "x = 'A\u{2728}B'".to_string();
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let file_id = ctx.add_file("scratch.qmd".to_string(), Some(content.clone()));
+        let location = quarto_source_map::SourceInfo::original(file_id, 7, 8);
+        let msg = DiagnosticMessageBuilder::warning("scratch")
+            .with_code("Q-2-9")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
+        let stripped = strip_ansi_colors(&text);
+
+        let lines: Vec<&str> = stripped.lines().collect();
+        let source_idx = lines
+            .iter()
+            .position(|l| l.contains("x = 'A\u{2728}B'"))
+            .unwrap_or_else(|| panic!("source line must render; got: {stripped:?}"));
+        let marker_line = lines[source_idx + 1];
+        // Skip past the gutter's own `│` (present on every row, e.g.
+        // `   │       │  `) to isolate the marker glyphs themselves.
+        let gutter_end = marker_line
+            .find('│')
+            .map(|i| i + '│'.len_utf8())
+            .unwrap_or_else(|| panic!("marker row must have a gutter `│`; got: {marker_line:?}"));
+        let marker = marker_line[gutter_end..].trim();
+
+        assert_eq!(
+            marker, "│",
+            "expected the zero-width `│` marker (a whole-character label \
+             would instead draw `┬─`); got {marker:?} in:\n{stripped}"
+        );
+    }
+
+    /// The same measurement as `ariadne_zero_width_label_renders_a_bare_marker`,
+    /// for the annotate-snippets renderer. See that test's doc comment for
+    /// why both ends of `SourceInfo::original(fid, 7, 8)` land on the same
+    /// mapped offset (6) after the `quarto-source-map` 0.1.2+ floor.
+    ///
+    /// annotate-snippets underlines a span with one `^` per byte of width,
+    /// so the discriminating measurement here is even more direct than
+    /// ariadne's marker shape: a zero-width label draws exactly one `^`,
+    /// a whole-character label draws two (`^^`).
+    #[cfg(feature = "annotate-snippets")]
+    #[test]
+    fn annotate_snippets_zero_width_label_renders_a_single_caret() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let content = "x = 'A\u{2728}B'".to_string();
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let file_id = ctx.add_file("scratch.qmd".to_string(), Some(content.clone()));
+        let location = quarto_source_map::SourceInfo::original(file_id, 7, 8);
+        let msg = DiagnosticMessageBuilder::warning("scratch")
+            .with_code("Q-2-9")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text =
+            msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::AnnotateSnippets));
+        let stripped = strip_ansi_colors(&text);
+
+        let lines: Vec<&str> = stripped.lines().collect();
+        let source_idx = lines
+            .iter()
+            .position(|l| l.contains("x = 'A\u{2728}B'"))
+            .unwrap_or_else(|| panic!("source line must render; got: {stripped:?}"));
+        let marker_line = lines[source_idx + 1];
+        let caret_run: String = marker_line.chars().filter(|&c| c == '^').collect();
+
+        assert_eq!(
+            caret_run, "^",
+            "expected a single `^` caret marking a zero-width label (a \
+             whole-character label would instead draw `^^`); got \
+             {caret_run:?} in line: {marker_line:?}"
+        );
+    }
+
     /// Forcing a specific renderer is honored: ariadne draws its boxed
     /// excerpt (the U+256D corner) while annotate-snippets does not.
     #[cfg(all(feature = "ariadne", feature = "annotate-snippets"))]
