@@ -654,19 +654,120 @@ impl DiagnosticMessage {
     /// Snap a mapped byte range onto UTF-8 character boundaries within
     /// `content`, clamping it into the file and keeping `start <= end`.
     ///
-    /// Both renderers slice the source by byte offset — ariadne in
-    /// `write.rs`, annotate-snippets in `renderer/source_map.rs` — and both
-    /// **panic** on an offset that falls inside a multi-byte character.
-    /// The offsets we hand them come from `SourceInfo` mappings, which are
-    /// not guaranteed to be boundary-aligned: a mapping that is off by a
-    /// byte is a cosmetic caret error on ASCII but a process abort next to
-    /// a multi-byte character. Printing a diagnostic must never be able to
-    /// kill a render, so we normalize here rather than trusting the input.
+    /// # Why the renderers need this
+    ///
+    /// Both source-context renderers slice the source by byte offset, and
+    /// both **panic** — they do not merely mis-render — on an offset that
+    /// falls inside a multi-byte character. Measured 2026-08-23 against the
+    /// versions this crate's lockfile resolves (ariadne 0.6.0,
+    /// annotate-snippets 0.12.16; the manifest declares only `0.6` and
+    /// `0.12`), rendering `"text: <span>Ask AI \u{2728}</span>"` in which
+    /// `\u{2728}` occupies bytes 19..22 and the offset each row names is
+    /// placed at 20 or 21 — both interior to that character:
+    ///
+    /// | offset placed mid-character | ariadne | annotate-snippets |
+    /// |---|---|---|
+    /// | label start   | panics, `write.rs:84`  | panics, `renderer/source_map.rs:71` |
+    /// | label end     | panics, `write.rs:102` | panics, `renderer/source_map.rs:98` |
+    /// | report anchor | panics, `write.rs:267` | n/a — this crate passes no separate anchor |
+    ///
+    /// The clamping half guards two further aborts that boundary-snapping
+    /// alone would not catch, measured the same way:
+    ///
+    /// | malformed range | ariadne | annotate-snippets |
+    /// |---|---|---|
+    /// | end past EOF          | tolerates (degraded excerpt) | panics, `renderer/source_map.rs:158` |
+    /// | inverted, `end < start` | panics, `lib.rs:145` (a plain `assert!`, so also in release) | `renderer/render.rs:1394` subtracts unchecked: panics only where overflow checks are on (debug/test), wraps silently in a default release build |
+    ///
+    /// Printing a diagnostic must never be able to kill a render, so we
+    /// normalize here rather than trusting the input.
+    ///
+    /// # What is actually load-bearing, and when
+    ///
+    /// **How much the snapping half is doing depends on what
+    /// `quarto-source-map` resolves to.** Since 0.1.2,
+    /// `FileInformation::offset_to_location` returns the *floored* offset
+    /// (`src/file_info.rs:116-125`:
+    /// `safe_offset` walks left onto a character boundary and is returned as
+    /// `Location.offset`; 0.1.0 and 0.1.1 computed `safe_offset` but returned
+    /// the raw `offset`). **This crate's declared floor is still
+    /// `quarto-source-map = "0.1.0"` (`Cargo.toml:28`)**, so a consumer that
+    /// resolves 0.1.0 or 0.1.1 — an existing lock, another graph member
+    /// pinning `=0.1.1`, `-Z minimal-versions` — gets no upstream floor at
+    /// all, and for that build the snap below is the only guard rather than
+    /// a backstop. A published library's lockfile does not constrain its
+    /// consumers; downstream, q2 had to raise its own floor, because this
+    /// manifest does not force it.
+    ///
+    /// On a resolution that *does* have the floor, it covers the mapping
+    /// path broadly: every value-producing path of `SourceInfo::map_offset`
+    /// runs through `offset_to_location` (`src/mapping.rs:38`; `Generated`
+    /// yields `None` instead), and all three call sites here are fed
+    /// `map_offset` results — the span shared by the report anchor and the
+    /// main label, and the detail-label spans, both in
+    /// `render_ariadne_source_context`; and the `clamp` closure in
+    /// `render_annotate_snippets_source_context`.
+    ///
+    /// So a mid-character offset can no longer reach a renderer through the
+    /// mapping path **when the span resolves within a single file**. The
+    /// cross-file `Concat` shape described below is an exception for the
+    /// snapping half as well as the clamping half: `map_offset` floors an
+    /// offset against the piece's *own* file content (`src/mapping.rs:25-38`),
+    /// which says nothing about where character boundaries fall in
+    /// `content`.
+    ///
+    /// The snap is therefore kept deliberately. It is the only guard on a
+    /// pre-0.1.2 resolution, a live guard on the cross-file shape, and the
+    /// backstop if the upstream floor regresses or a future caller hands us
+    /// raw, unmapped offsets.
+    ///
+    /// **The clamping half is still live.** `end_mapped` is not always the
+    /// mapped image of this span's end: when `map_offset(length())` fails,
+    /// both renderer paths substitute `map_offset(length() - 1)` and then
+    /// fall back to `start_mapped` (the `length() - 1` fallback at
+    /// `:842-852` in `render_ariadne_source_context` and `:1038-1047` in
+    /// `render_annotate_snippets_source_context`, line numbers as of 0.2.2).
+    /// And `content` belongs to `root_file_id()`, which for a `Concat` is
+    /// the file of the *first* piece that resolves to one
+    /// (`quarto-source-map`'s `src/source_info.rs:549-560`), while
+    /// `map_offset` resolves into whichever piece contains the offset.
+    /// Structurally, then — a `Concat` spanning two files — the two ends
+    /// can resolve into different files, whose offsets are neither ordered
+    /// with respect to each other nor bounded by `content.len()`. (That
+    /// shape is permitted by the types; unlike the panics tabled above it
+    /// has not been exercised here.) `start.min(len)`, `end.min(len)` and
+    /// `.max(s)` reduce any of that to an in-range, non-inverted span.
+    ///
+    /// # Behaviour
     ///
     /// The range is widened, not truncated: `start` floors to the start of
     /// the character containing it and `end` ceils to the end of the
     /// character containing it, so the highlight covers whole characters
-    /// and can never invert.
+    /// and can never invert. This differs from the upstream floor, which
+    /// walks an end offset *left* rather than widening it; the two agree
+    /// whenever only the start is misaligned.
+    ///
+    /// # Coverage
+    ///
+    /// The direct unit coverage is `snap_span_widens_to_whole_characters`.
+    /// The two `..._renders_diagnostic_with_originally_mid_character_span`
+    /// tests are end-to-end smoke checks only, and do not bind to this
+    /// helper: commit `5e48166`, *"Re-anchor the mid-character-span crash
+    /// tests after the 0.1.3 floor"*, re-anchored them and records why. (It
+    /// is a commit of PR #5, which was squash-merged as `87f1d38`, so it is
+    /// reachable through that PR rather than from `main`'s history.)
+    ///
+    /// Downstream, the quarto-dev/q2 repository is adding an end-to-end pin
+    /// for the founding crash, under `crates/quarto/tests/integration/`: it
+    /// drives the real `q2` binary over a website project whose
+    /// `_quarto.yml` navbar entry embeds `\u{2728}` **mid-string**, as
+    /// `text: '<span id="x">Ask AI \u{2728}</span>'`, and asserts a clean
+    /// exit alongside the expected caret columns. The trailing `</span>` is
+    /// load-bearing — one asserted caret falls past it — so it is the same
+    /// shape as this crate's own tests, where `\u{2728}` sits at bytes
+    /// 19..22 and `</span>` at 22..29. That pin will redden only if q2's
+    /// mapping regresses *and* both this snap and the upstream floor are
+    /// gone: it guards the combination, not this helper on its own.
     #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
     fn snap_span_to_char_boundaries(
         content: &str,
