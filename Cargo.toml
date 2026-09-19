@@ -8,7 +8,7 @@ resolver = "3"
 
 [package]
 name = "quarto-error-reporting"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 authors = ["Posit Software, PBC"]
 license = "MIT"
@@ -25,7 +25,7 @@ exclude = [".cargo", ".claude", ".github", "claude-notes", "CLAUDE.md"]
 
 [dependencies]
 # Source location tracking (published leaf crate).
-quarto-source-map = "0.1.0"
+quarto-source-map = "0.2.0"
 
 # Error reporting — source-context snippet renderers. Both are optional
 # and feature-gated so consumers can pick a rendering style (or compile
