@@ -909,7 +909,7 @@ impl DiagnosticMessage {
         };
 
         // Convert to file:// URL (handles Windows/Unix + percent-encoding)
-        let mut file_url = match url::Url::from_file_path(&abs_path) {
+        let mut file_url = match url::Url::from_file_path(Self::plain_absolute_path(abs_path)) {
             Ok(url) => url.as_str().to_string(),
             Err(_) => return path.to_string(), // Conversion failed, skip hyperlink
         };
@@ -930,6 +930,29 @@ impl DiagnosticMessage {
 
         // Wrap with OSC 8 codes: \x1b]8;;URI\x1b\\TEXT\x1b]8;;\x1b\\
         format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", file_url, path)
+    }
+
+    /// The absolute path to hand to `url::Url::from_file_path`.
+    ///
+    /// Gated with `wrap_path_with_hyperlink` (its only production caller);
+    /// unit tests call it so the expected URL is computed the same way the
+    /// production renderer does. Windows: `fs::canonicalize` returns
+    /// verbatim (`\\?\C:\…`) paths, which the url crate renders as
+    /// `file://?/C:/…` — no terminal can open that. Strip the verbatim
+    /// prefix (`\\?\UNC\` → `\\`) to get the plain absolute form.
+    #[cfg(all(feature = "ariadne", not(target_family = "wasm")))]
+    fn plain_absolute_path(p: std::path::PathBuf) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let s = p.as_os_str().to_string_lossy();
+            if let Some(rest) = s.strip_prefix(r#"\\?\UNC\"#) {
+                return std::path::PathBuf::from(format!(r"\\{rest}"));
+            }
+            if let Some(rest) = s.strip_prefix(r#"\\?\"#) {
+                return std::path::PathBuf::from(rest);
+            }
+        }
+        p
     }
 
     /// The disk path a file's label should hyperlink to: the owning
@@ -2676,8 +2699,15 @@ mod tests {
         };
         let text = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
 
+        // Compute the expected URL exactly the way the renderer does, so
+        // platform-specific path forms (Windows verbatim `\\?\…`) can't
+        // make the test diverge from production.
         let canonical = std::fs::canonicalize(&notebook).unwrap();
-        let expected_prefix = format!("file://{}", canonical.display());
+        let expected_prefix =
+            url::Url::from_file_path(super::DiagnosticMessage::plain_absolute_path(canonical))
+                .unwrap()
+                .as_str()
+                .to_string();
         let urls = osc8_urls(&text);
         let cell_link = urls
             .iter()
