@@ -8,7 +8,7 @@ resolver = "3"
 
 [package]
 name = "quarto-error-reporting"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 authors = ["Posit Software, PBC"]
 license = "MIT"
@@ -25,7 +25,7 @@ exclude = [".cargo", ".claude", ".github", "claude-notes", "CLAUDE.md"]
 
 [dependencies]
 # Source location tracking (published leaf crate).
-quarto-source-map = "0.2.0"
+quarto-source-map = "0.3.0"
 
 # Error reporting — source-context snippet renderers. Both are optional
 # and feature-gated so consumers can pick a rendering style (or compile
@@ -44,6 +44,11 @@ schemars = { version = "1.2.1", optional = true }
 # URL handling for file:// hyperlinks
 url = "2.5"
 
+[dev-dependencies]
+# Real on-disk files for the origin-hyperlink tests (a virtual cell file
+# hyperlinks its owning notebook, which must canonicalize).
+tempfile = "3"
+
 [features]
 # `ariadne` is the historical default renderer; keep it on by default so
 # existing consumers see no change. `annotate-snippets` (rust-lang's
@@ -57,4 +62,4 @@ annotate-snippets = ["dep:annotate-snippets"]
 # The `json.rs` wire shape (JsonDiagnostic etc.) and its `schemars`
 # dependency are opt-in. Default-off so a consumer that only needs the
 # diagnostic/builder/render API gets a leaner build with no schemars.
-json = ["dep:schemars"]
+json = ["dep:schemars", "quarto-source-map/schemars"]

@@ -106,6 +106,17 @@ pub struct JsonDiagnostic {
     /// (rare but possible for project-level errors with no span).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rendered: Option<String>,
+    /// Structured provenance for diagnostics rooted in a *virtual* file
+    /// (plan 7c): e.g. a notebook cell carries
+    /// `{kind: notebook_cell, notebook_path, cell_index (1-based), cell_id,
+    /// cell_type}`. The `start_line`/`start_column` fields are relative to
+    /// the virtual file's own content, so a consumer needs the origin to
+    /// address the position the author sees — (cell, line, column) within
+    /// `origin.notebook_path`. `None` when the diagnostic's file is a real
+    /// file (or unlocated), in which case the line/column fields already
+    /// refer to it directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<quarto_source_map::FileOrigin>,
 }
 
 /// A Pass-1 failure (parse error or metadata error) in a project
@@ -163,10 +174,16 @@ impl JsonPass1Failure {
 /// the [`SourceContext`] to map byte offsets to 1-based
 /// line/column numbers.
 pub fn diagnostic_to_json(diag: &DiagnosticMessage, ctx: &SourceContext) -> JsonDiagnostic {
-    // Map the main location
+    // Map the main location. The mapped start is kept for the origin
+    // lookup below (the file the diagnostic is rooted in carries the
+    // provenance).
+    let mapped_start = diag
+        .location
+        .as_ref()
+        .and_then(|loc| loc.map_offset(0, ctx));
     let (start_line, start_column, end_line, end_column) = if let Some(loc) = &diag.location {
         // Map start position (offset 0 relative to this SourceInfo)
-        let start = loc.map_offset(0, ctx);
+        let start = mapped_start.clone();
         // Map end position (offset = length of span)
         let end = loc
             .map_offset(loc.length(), ctx)
@@ -254,6 +271,15 @@ pub fn diagnostic_to_json(diag: &DiagnosticMessage, ctx: &SourceContext) -> Json
 
     let hints: Vec<String> = diag.hints.iter().map(|h| h.as_str().to_string()).collect();
 
+    // Structured origin for virtual-file diagnostics: the file the main
+    // location's *start* resolves into carries the provenance. Details are
+    // intentionally not origin-tagged — they have no file field at all and
+    // their coordinates are already auxiliary.
+    let origin = mapped_start
+        .as_ref()
+        .and_then(|s| ctx.get_file(s.file_id))
+        .and_then(|f| f.metadata.origin.clone());
+
     // bd-352bh: pre-render the ariadne source-context snippet for
     // diagnostics that have a location. `DiagnosticMessage::to_text`
     // delegates to ariadne when both the diagnostic's location AND
@@ -287,6 +313,7 @@ pub fn diagnostic_to_json(diag: &DiagnosticMessage, ctx: &SourceContext) -> Json
         source_file: None,
         details,
         rendered,
+        origin,
     }
 }
 
@@ -475,6 +502,86 @@ mod tests {
         assert!(
             !serialized.contains("\"rendered\""),
             "JSON should omit `rendered` when None; got: {serialized}",
+        );
+    }
+
+    // ─── plan 7c: structured `origin` for virtual files ──────────
+
+    /// A located diagnostic rooted in a notebook-cell virtual file
+    /// carrying `FileMetadata::origin`.
+    fn cell_located_diag() -> (DiagnosticMessage, SourceContext) {
+        use quarto_source_map::{
+            FileOrigin, SourceInfo,
+            types::{Location, Range},
+        };
+        let mut ctx = SourceContext::new();
+        let file_id = ctx.add_file(
+            "notebook.ipynb[cell 3, code]".to_string(),
+            Some("print('boom')\n".to_string()),
+        );
+        ctx.get_file_mut(file_id).unwrap().metadata.origin = Some(FileOrigin::NotebookCell {
+            notebook_path: "notebook.ipynb".to_string(),
+            cell_index: 3,
+            cell_id: Some("cell-xyz".to_string()),
+            cell_type: "code".to_string(),
+        });
+        let info = SourceInfo::from_range(
+            file_id,
+            Range {
+                start: Location {
+                    offset: 7,
+                    row: 0,
+                    column: 7,
+                },
+                end: Location {
+                    offset: 11,
+                    row: 0,
+                    column: 11,
+                },
+            },
+        );
+        let mut diag = DiagnosticMessage::error("NameError").with_code("Q-IPYNB-1");
+        diag.location = Some(info);
+        (diag, ctx)
+    }
+
+    #[test]
+    fn origin_is_some_for_cell_rooted_diagnostics() {
+        let (diag, ctx) = cell_located_diag();
+        let json = diagnostic_to_json(&diag, &ctx);
+        assert_eq!(
+            json.origin,
+            Some(quarto_source_map::FileOrigin::NotebookCell {
+                notebook_path: "notebook.ipynb".to_string(),
+                cell_index: 3,
+                cell_id: Some("cell-xyz".to_string()),
+                cell_type: "code".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn origin_serializes_with_all_fields() {
+        let (diag, ctx) = cell_located_diag();
+        let json = diagnostic_to_json(&diag, &ctx);
+        let v = serde_json::to_value(&json).unwrap();
+        let origin = v.get("origin").expect("origin must serialize");
+        assert_eq!(origin["kind"], "notebook_cell");
+        assert_eq!(origin["notebook_path"], "notebook.ipynb");
+        assert_eq!(origin["cell_index"], 3);
+        assert_eq!(origin["cell_id"], "cell-xyz");
+        assert_eq!(origin["cell_type"], "code");
+    }
+
+    #[test]
+    fn origin_is_absent_for_plain_file_diagnostics() {
+        let (diag, ctx) = synth_located_diag();
+        let json = diagnostic_to_json(&diag, &ctx);
+        assert!(json.origin.is_none());
+        let serialized = serde_json::to_string(&json).unwrap();
+        assert!(
+            !serialized.contains("\"origin\""),
+            "None origin must be omitted from the wire shape: {serialized}",
         );
     }
 }
