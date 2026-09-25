@@ -247,6 +247,44 @@ pub struct DiagnosticMessage {
     pub location: Option<quarto_source_map::SourceInfo>,
 }
 
+/// A minimal multi-source [`ariadne::Cache`] over in-memory files, keyed
+/// by display path. The single-file `(id, source)` tuple used previously
+/// cannot serve labels rooted in another `Concat` piece, which need one
+/// source section per file.
+#[cfg(feature = "ariadne")]
+struct ContextSourceCache {
+    files: Vec<(String, ariadne::Source<String>)>,
+}
+
+#[cfg(feature = "ariadne")]
+impl ariadne::Cache<String> for ContextSourceCache {
+    type Storage = String;
+
+    fn fetch(&mut self, id: &String) -> Result<&ariadne::Source<String>, impl std::fmt::Debug> {
+        self.files
+            .iter()
+            .find(|(path, _)| path == id)
+            .map(|(_, source)| source)
+            .ok_or(MissingSource)
+    }
+
+    fn display<'a>(&self, id: &'a String) -> Option<impl std::fmt::Display + 'a> {
+        Some(id)
+    }
+}
+
+/// Fetch-error type for [`ContextSourceCache`]; ariadne only formats it
+/// into an eprintln for sources no label references.
+#[cfg(feature = "ariadne")]
+struct MissingSource;
+
+#[cfg(feature = "ariadne")]
+impl std::fmt::Debug for MissingSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source not registered in the diagnostic's source context")
+    }
+}
+
 impl DiagnosticMessage {
     /// Access the diagnostic message builder API.
     ///
@@ -654,19 +692,120 @@ impl DiagnosticMessage {
     /// Snap a mapped byte range onto UTF-8 character boundaries within
     /// `content`, clamping it into the file and keeping `start <= end`.
     ///
-    /// Both renderers slice the source by byte offset — ariadne in
-    /// `write.rs`, annotate-snippets in `renderer/source_map.rs` — and both
-    /// **panic** on an offset that falls inside a multi-byte character.
-    /// The offsets we hand them come from `SourceInfo` mappings, which are
-    /// not guaranteed to be boundary-aligned: a mapping that is off by a
-    /// byte is a cosmetic caret error on ASCII but a process abort next to
-    /// a multi-byte character. Printing a diagnostic must never be able to
-    /// kill a render, so we normalize here rather than trusting the input.
+    /// # Why the renderers need this
+    ///
+    /// Both source-context renderers slice the source by byte offset, and
+    /// both **panic** — they do not merely mis-render — on an offset that
+    /// falls inside a multi-byte character. Measured 2026-08-23 against the
+    /// versions this crate's lockfile resolves (ariadne 0.6.0,
+    /// annotate-snippets 0.12.16; the manifest declares only `0.6` and
+    /// `0.12`), rendering `"text: <span>Ask AI \u{2728}</span>"` in which
+    /// `\u{2728}` occupies bytes 19..22 and the offset each row names is
+    /// placed at 20 or 21 — both interior to that character:
+    ///
+    /// | offset placed mid-character | ariadne | annotate-snippets |
+    /// |---|---|---|
+    /// | label start   | panics, `write.rs:84`  | panics, `renderer/source_map.rs:71` |
+    /// | label end     | panics, `write.rs:102` | panics, `renderer/source_map.rs:98` |
+    /// | report anchor | panics, `write.rs:267` | n/a — this crate passes no separate anchor |
+    ///
+    /// The clamping half guards two further aborts that boundary-snapping
+    /// alone would not catch, measured the same way:
+    ///
+    /// | malformed range | ariadne | annotate-snippets |
+    /// |---|---|---|
+    /// | end past EOF          | tolerates (degraded excerpt) | panics, `renderer/source_map.rs:158` |
+    /// | inverted, `end < start` | panics, `lib.rs:145` (a plain `assert!`, so also in release) | `renderer/render.rs:1394` subtracts unchecked: panics only where overflow checks are on (debug/test), wraps silently in a default release build |
+    ///
+    /// Printing a diagnostic must never be able to kill a render, so we
+    /// normalize here rather than trusting the input.
+    ///
+    /// # What is actually load-bearing, and when
+    ///
+    /// **How much the snapping half is doing depends on what
+    /// `quarto-source-map` resolves to.** Since 0.1.2,
+    /// `FileInformation::offset_to_location` returns the *floored* offset
+    /// (`src/file_info.rs:116-125`:
+    /// `safe_offset` walks left onto a character boundary and is returned as
+    /// `Location.offset`; 0.1.0 and 0.1.1 computed `safe_offset` but returned
+    /// the raw `offset`). **This crate's declared floor is still
+    /// `quarto-source-map = "0.1.0"` (`Cargo.toml:28`)**, so a consumer that
+    /// resolves 0.1.0 or 0.1.1 — an existing lock, another graph member
+    /// pinning `=0.1.1`, `-Z minimal-versions` — gets no upstream floor at
+    /// all, and for that build the snap below is the only guard rather than
+    /// a backstop. A published library's lockfile does not constrain its
+    /// consumers; downstream, q2 had to raise its own floor, because this
+    /// manifest does not force it.
+    ///
+    /// On a resolution that *does* have the floor, it covers the mapping
+    /// path broadly: every value-producing path of `SourceInfo::map_offset`
+    /// runs through `offset_to_location` (`src/mapping.rs:38`; `Generated`
+    /// yields `None` instead), and all three call sites here are fed
+    /// `map_offset` results — the span shared by the report anchor and the
+    /// main label, and the detail-label spans, both in
+    /// `render_ariadne_source_context`; and the `clamp` closure in
+    /// `render_annotate_snippets_source_context`.
+    ///
+    /// So a mid-character offset can no longer reach a renderer through the
+    /// mapping path **when the span resolves within a single file**. The
+    /// cross-file `Concat` shape described below is an exception for the
+    /// snapping half as well as the clamping half: `map_offset` floors an
+    /// offset against the piece's *own* file content (`src/mapping.rs:25-38`),
+    /// which says nothing about where character boundaries fall in
+    /// `content`.
+    ///
+    /// The snap is therefore kept deliberately. It is the only guard on a
+    /// pre-0.1.2 resolution, a live guard on the cross-file shape, and the
+    /// backstop if the upstream floor regresses or a future caller hands us
+    /// raw, unmapped offsets.
+    ///
+    /// **The clamping half is still live.** `end_mapped` is not always the
+    /// mapped image of this span's end: when `map_offset(length())` fails,
+    /// both renderer paths substitute `map_offset(length() - 1)` and then
+    /// fall back to `start_mapped` (the `length() - 1` fallback at
+    /// `:842-852` in `render_ariadne_source_context` and `:1038-1047` in
+    /// `render_annotate_snippets_source_context`, line numbers as of 0.2.2).
+    /// And `content` belongs to `root_file_id()`, which for a `Concat` is
+    /// the file of the *first* piece that resolves to one
+    /// (`quarto-source-map`'s `src/source_info.rs:549-560`), while
+    /// `map_offset` resolves into whichever piece contains the offset.
+    /// Structurally, then — a `Concat` spanning two files — the two ends
+    /// can resolve into different files, whose offsets are neither ordered
+    /// with respect to each other nor bounded by `content.len()`. (That
+    /// shape is permitted by the types; unlike the panics tabled above it
+    /// has not been exercised here.) `start.min(len)`, `end.min(len)` and
+    /// `.max(s)` reduce any of that to an in-range, non-inverted span.
+    ///
+    /// # Behaviour
     ///
     /// The range is widened, not truncated: `start` floors to the start of
     /// the character containing it and `end` ceils to the end of the
     /// character containing it, so the highlight covers whole characters
-    /// and can never invert.
+    /// and can never invert. This differs from the upstream floor, which
+    /// walks an end offset *left* rather than widening it; the two agree
+    /// whenever only the start is misaligned.
+    ///
+    /// # Coverage
+    ///
+    /// The direct unit coverage is `snap_span_widens_to_whole_characters`.
+    /// The two `..._renders_diagnostic_with_originally_mid_character_span`
+    /// tests are end-to-end smoke checks only, and do not bind to this
+    /// helper: commit `5e48166`, *"Re-anchor the mid-character-span crash
+    /// tests after the 0.1.3 floor"*, re-anchored them and records why. (It
+    /// is a commit of PR #5, which was squash-merged as `87f1d38`, so it is
+    /// reachable through that PR rather than from `main`'s history.)
+    ///
+    /// Downstream, the quarto-dev/q2 repository is adding an end-to-end pin
+    /// for the founding crash, under `crates/quarto/tests/integration/`: it
+    /// drives the real `q2` binary over a website project whose
+    /// `_quarto.yml` navbar entry embeds `\u{2728}` **mid-string**, as
+    /// `text: '<span id="x">Ask AI \u{2728}</span>'`, and asserts a clean
+    /// exit alongside the expected caret columns. The trailing `</span>` is
+    /// load-bearing — one asserted caret falls past it — so it is the same
+    /// shape as this crate's own tests, where `\u{2728}` sits at bytes
+    /// 19..22 and `</span>` at 22..29. That pin will redden only if q2's
+    /// mapping regresses *and* both this snap and the upstream floor are
+    /// gone: it guards the combination, not this helper on its own.
     #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
     fn snap_span_to_char_boundaries(
         content: &str,
@@ -795,6 +934,32 @@ impl DiagnosticMessage {
         path.to_string()
     }
 
+    /// One-line textual location for a span whose two ends resolve into
+    /// different `Concat` pieces, rendered in place of a snippet. A
+    /// cross-piece span cannot be drawn as one excerpt, and clamping it
+    /// into either piece's content would point at the wrong file.
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+    fn format_cross_piece_location(
+        start: &quarto_source_map::MappedLocation,
+        end: &quarto_source_map::MappedLocation,
+        ctx: &quarto_source_map::SourceContext,
+    ) -> String {
+        let name = |file_id| match ctx.get_file(file_id) {
+            Some(file) => file.path.clone(),
+            None => "<unknown file>".to_string(),
+        };
+        // Line and column numbers are 1-indexed for display (Location uses 0-indexed)
+        format!(
+            "  --> {}:{}:{} (spans through {}:{}:{})\n",
+            name(start.file_id),
+            start.location.row + 1,
+            start.location.column + 1,
+            name(end.file_id),
+            end.location.row + 1,
+            end.location.column + 1,
+        )
+    }
+
     /// Render source context using ariadne (private helper for to_text).
     ///
     /// This produces the visual source code snippet with highlighting.
@@ -815,8 +980,15 @@ impl DiagnosticMessage {
         // changes the colour.
         const ARIADNE_UNIMPORTANT_COLOR: Color = Color::Fixed(249);
 
-        // Extract file_id from the source mapping by traversing the chain
-        let file_id = main_location.root_file_id()?;
+        // The report's file is the one the span *starts* in. For a
+        // multi-piece `Concat` (q2's per-cell ipynb virtual files),
+        // `root_file_id()` is the first piece's file — wrong for a
+        // diagnostic rooted in a later piece — while `map_offset`
+        // resolves piece-aware. `start_mapped.file_id` is correct for
+        // both shapes (and identical to `root_file_id()` on a
+        // single-file source).
+        let start_mapped = main_location.map_offset(0, ctx)?;
+        let file_id = start_mapped.file_id;
 
         let file = ctx.get_file(file_id)?;
 
@@ -833,9 +1005,6 @@ impl DiagnosticMessage {
             },
         };
 
-        // Map the location offsets back to original file positions
-        // map_offset expects relative offsets (0 = start of this SourceInfo's range)
-        let start_mapped = main_location.map_offset(0, ctx)?;
         // For end offset, try the full length first. If that fails (e.g., when the span
         // extends past EOF), clamp to the last valid position. This handles edge cases
         // like errors pointing to EOF or diagnostics with off-by-one end offsets.
@@ -850,6 +1019,18 @@ impl DiagnosticMessage {
                 }
             })
             .unwrap_or_else(|| start_mapped.clone());
+
+        // A span whose two ends resolve into different pieces cannot be
+        // drawn as one snippet — rendering it against either piece's
+        // content would clamp it silently into the wrong file. Label both
+        // ends textually instead.
+        if end_mapped.file_id != start_mapped.file_id {
+            return Some(Self::format_cross_piece_location(
+                &start_mapped,
+                &end_mapped,
+                ctx,
+            ));
+        }
 
         // Create display path with OSC 8 hyperlink for clickable file paths
         // Check if this path refers to a real file on disk (vs an ephemeral in-memory file)
@@ -918,63 +1099,115 @@ impl DiagnosticMessage {
                 .with_order(main_span.end as i32),
         );
 
-        // Add detail locations as additional labels (only those with locations)
+        // Add detail locations as additional labels (only those with locations).
+        // Details rooted (start and end) in the report's file stay inline
+        // labels; details rooted wholly in another piece are collected and
+        // appended after the loop as labels in their own file's source
+        // section. A detail whose own span straddles pieces is not
+        // representable as one inline label and is skipped (the main-span
+        // cross-piece label above covers the common cross-cell shape).
+        let mut cache_files = vec![(display_path.clone(), Source::from(content.clone()))];
+        let mut foreign_labels: Vec<(String, std::ops::Range<usize>, Option<String>, Color)> =
+            Vec::new();
         for detail in &self.details {
             if let Some(detail_loc) = &detail.location {
-                // Extract file_id from detail location
-                let detail_file_id = match detail_loc.root_file_id() {
-                    Some(fid) => fid,
-                    None => continue, // Skip if we can't extract file_id
+                // Map detail offsets to original file positions
+                // map_offset expects relative offsets (0 = start of SourceInfo's range)
+                let (Some(detail_start), Some(detail_end)) = (
+                    detail_loc.map_offset(0, ctx),
+                    detail_loc.map_offset(detail_loc.length(), ctx),
+                ) else {
+                    continue;
+                };
+                let detail_color = match detail.kind {
+                    DetailKind::Error => Color::Red,
+                    DetailKind::Info => Color::Cyan,
+                    DetailKind::Note => Color::Blue,
+                    // Match Ariadne's unimportant colour so faded
+                    // labels visually disappear into the surrounding
+                    // unlabelled text.
+                    DetailKind::Faded => ARIADNE_UNIMPORTANT_COLOR,
                 };
 
-                if detail_file_id == file_id {
-                    // Map detail offsets to original file positions
-                    // map_offset expects relative offsets (0 = start of SourceInfo's range)
-                    if let (Some(detail_start), Some(detail_end)) = (
-                        detail_loc.map_offset(0, ctx),
-                        detail_loc.map_offset(detail_loc.length(), ctx),
-                    ) {
-                        let detail_span = Self::snap_span_to_char_boundaries(
-                            &content,
-                            detail_start.location.offset,
-                            detail_end.location.offset,
-                        );
-                        let detail_color = match detail.kind {
-                            DetailKind::Error => Color::Red,
-                            DetailKind::Info => Color::Cyan,
-                            DetailKind::Note => Color::Blue,
-                            // Match Ariadne's unimportant colour so faded
-                            // labels visually disappear into the surrounding
-                            // unlabelled text.
-                            DetailKind::Faded => ARIADNE_UNIMPORTANT_COLOR,
-                        };
-
-                        // Empty-content details exist purely to force Ariadne
-                        // to display a line that would otherwise be elided
-                        // inside a multi-line span. Leaving the label's
-                        // message at None makes Ariadne skip drawing the
-                        // `╰── ...` arrow row underneath, so the source line
-                        // appears clean.
-                        let mut label = Label::new((display_path.clone(), detail_span.clone()))
-                            .with_color(detail_color)
-                            .with_order(detail_span.end as i32);
-                        if !detail.content.as_str().is_empty() {
-                            label = label.with_message(detail.content.as_str());
-                        }
-                        report = report.with_label(label);
+                if detail_start.file_id == detail_end.file_id && detail_start.file_id != file_id {
+                    // Wholly inside another piece: render it there as its
+                    // own source section instead of silently dropping it.
+                    let Some(detail_file) = ctx.get_file(detail_start.file_id) else {
+                        continue;
+                    };
+                    let Some(detail_content) = detail_file
+                        .content
+                        .clone()
+                        .or_else(|| std::fs::read_to_string(&detail_file.path).ok())
+                    else {
+                        continue;
+                    };
+                    // File-level id (no per-line hyperlink fragment) so
+                    // several details in one foreign file share a source
+                    // section; ariadne derives the header line:column from
+                    // the label span itself.
+                    let foreign_display = Self::wrap_path_with_hyperlink(
+                        &detail_file.path,
+                        std::path::Path::new(&detail_file.path).exists(),
+                        None,
+                        None,
+                        enable_hyperlinks,
+                    );
+                    let detail_span = Self::snap_span_to_char_boundaries(
+                        &detail_content,
+                        detail_start.location.offset,
+                        detail_end.location.offset,
+                    );
+                    if !cache_files.iter().any(|(path, _)| *path == foreign_display) {
+                        cache_files.push((foreign_display.clone(), Source::from(detail_content)));
                     }
+                    let message = (!detail.content.as_str().is_empty())
+                        .then(|| detail.content.as_str().to_string());
+                    foreign_labels.push((foreign_display, detail_span, message, detail_color));
+                    continue;
+                }
+
+                if detail_start.file_id == file_id && detail_end.file_id == file_id {
+                    let detail_span = Self::snap_span_to_char_boundaries(
+                        &content,
+                        detail_start.location.offset,
+                        detail_end.location.offset,
+                    );
+                    // Empty-content details exist purely to force Ariadne
+                    // to display a line that would otherwise be elided
+                    // inside a multi-line span. Leaving the label's
+                    // message at None makes Ariadne skip drawing the
+                    // `╰── ...` arrow row underneath, so the source line
+                    // appears clean.
+                    let mut label = Label::new((display_path.clone(), detail_span.clone()))
+                        .with_color(detail_color)
+                        .with_order(detail_span.end as i32);
+                    if !detail.content.as_str().is_empty() {
+                        label = label.with_message(detail.content.as_str());
+                    }
+                    report = report.with_label(label);
                 }
             }
+        }
+
+        // Foreign-piece labels sort after every same-file label so
+        // ariadne's order-keyed grouping draws the report's file first,
+        // intact; no realistic same-file span end reaches this base.
+        for (foreign_order, (path, span, message, color)) in (1_000_000i32..).zip(foreign_labels) {
+            let mut label = Label::new((path, span))
+                .with_color(color)
+                .with_order(foreign_order);
+            if let Some(message) = message {
+                label = label.with_message(message);
+            }
+            report = report.with_label(label);
         }
 
         // Render to string
         let report = report.finish();
         let mut output = Vec::new();
         report
-            .write(
-                (display_path.clone(), Source::from(content.as_str())),
-                &mut output,
-            )
+            .write(ContextSourceCache { files: cache_files }, &mut output)
             .ok()?;
 
         let output_str = String::from_utf8(output).ok()?;
@@ -1018,8 +1251,34 @@ impl DiagnosticMessage {
     ) -> Option<String> {
         use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
 
-        // Resolve the root file and its content (same as the ariadne path).
-        let file_id = main_location.root_file_id()?;
+        // The report's file is the one the span *starts* in — same
+        // contract as the ariadne path: `root_file_id()` is the first
+        // `Concat` piece's file, wrong for a diagnostic rooted in a
+        // later piece, while `map_offset` resolves piece-aware.
+        let start_mapped = main_location.map_offset(0, ctx)?;
+        let file_id = start_mapped.file_id;
+
+        // A span whose two ends resolve into different pieces cannot be
+        // drawn as one snippet; label both ends textually rather than
+        // silently clamping into one piece's content.
+        let end_mapped = main_location
+            .map_offset(main_location.length(), ctx)
+            .or_else(|| {
+                if main_location.length() > 0 {
+                    main_location.map_offset(main_location.length() - 1, ctx)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| start_mapped.clone());
+        if end_mapped.file_id != start_mapped.file_id {
+            return Some(Self::format_cross_piece_location(
+                &start_mapped,
+                &end_mapped,
+                ctx,
+            ));
+        }
+
         let file = ctx.get_file(file_id)?;
         let content = match &file.content {
             Some(c) => c.clone(),
@@ -1032,19 +1291,6 @@ impl DiagnosticMessage {
             Self::snap_span_to_char_boundaries(&content, start, end)
         };
 
-        // Map the main location's offsets back to original-file byte
-        // positions, clamping the end past EOF like the ariadne path.
-        let start_mapped = main_location.map_offset(0, ctx)?;
-        let end_mapped = main_location
-            .map_offset(main_location.length(), ctx)
-            .or_else(|| {
-                if main_location.length() > 0 {
-                    main_location.map_offset(main_location.length() - 1, ctx)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| start_mapped.clone());
         let main_span = clamp(start_mapped.location.offset, end_mapped.location.offset);
 
         let level = match self.kind {
@@ -1065,7 +1311,13 @@ impl DiagnosticMessage {
             .line_start(1)
             .annotation(AnnotationKind::Primary.span(main_span).label(main_message));
 
-        // Detail locations in the same file become Context annotations.
+        // Details rooted (start and end) in the report's file become
+        // Context annotations; details rooted wholly in another piece
+        // render as their own snippet element below the main one instead
+        // of being silently dropped. A detail whose own span straddles
+        // pieces is not representable as one annotation and is skipped
+        // (the main-span cross-piece label covers the common shape).
+        let mut foreign: Vec<(String, String, std::ops::Range<usize>, &str)> = Vec::new();
         for detail in &self.details {
             // Skip empty-content padding details (see the doc comment).
             if detail.content.as_str().is_empty() {
@@ -1074,13 +1326,37 @@ impl DiagnosticMessage {
             let Some(detail_loc) = &detail.location else {
                 continue;
             };
-            if detail_loc.root_file_id() != Some(file_id) {
-                continue;
-            }
-            if let (Some(detail_start), Some(detail_end)) = (
+            let (Some(detail_start), Some(detail_end)) = (
                 detail_loc.map_offset(0, ctx),
                 detail_loc.map_offset(detail_loc.length(), ctx),
-            ) {
+            ) else {
+                continue;
+            };
+            if detail_start.file_id == detail_end.file_id && detail_start.file_id != file_id {
+                let Some(detail_file) = ctx.get_file(detail_start.file_id) else {
+                    continue;
+                };
+                let Some(detail_content) = detail_file
+                    .content
+                    .clone()
+                    .or_else(|| std::fs::read_to_string(&detail_file.path).ok())
+                else {
+                    continue;
+                };
+                let detail_span = Self::snap_span_to_char_boundaries(
+                    &detail_content,
+                    detail_start.location.offset,
+                    detail_end.location.offset,
+                );
+                foreign.push((
+                    detail_file.path.clone(),
+                    detail_content,
+                    detail_span,
+                    detail.content.as_str(),
+                ));
+                continue;
+            }
+            if detail_start.file_id == file_id && detail_end.file_id == file_id {
                 let detail_span = clamp(detail_start.location.offset, detail_end.location.offset);
                 snippet = snippet.annotation(
                     AnnotationKind::Context
@@ -1090,12 +1366,24 @@ impl DiagnosticMessage {
             }
         }
 
-        // Build the titled group; render the error code natively via `id`.
+        // Build the titled group; render the error code natively via `id`,
+        // then append each foreign-piece detail as its own snippet element
+        // (annotate-snippets draws one excerpt per element, each with its
+        // own `--> path` header).
         let mut title = level.primary_title(self.title.as_str());
         if let Some(code) = &self.code {
             title = title.id(code.as_str());
         }
-        let group = title.element(snippet);
+        let mut group = title.element(snippet);
+        // Iterate by reference: the built `Snippet`s borrow `path`/`content`,
+        // so the owned strings must stay alive in `foreign` until `render`.
+        for (path, content, span, message) in &foreign {
+            let extra = Snippet::source(content.as_str())
+                .path(path)
+                .line_start(1)
+                .annotation(AnnotationKind::Context.span(span.clone()).label(*message));
+            group = group.element(extra);
+        }
 
         // `Renderer::render` returns text with no trailing newline, but
         // `to_text` appends unlocated details and hints directly after the
@@ -1863,5 +2151,409 @@ mod tests {
             "annotate-snippets does not"
         );
         assert!(strip_ansi(&snippets).contains("-->"));
+    }
+
+    // ==================== Concat / cross-piece rendering ====================
+    //
+    // A diagnostic whose location resolves through a multi-piece `Concat`
+    // (the shape q2's ipynb processor produces: one virtual file per
+    // notebook cell) must render against the piece the span actually
+    // resolves into — not `root_file_id()`, which is the *first* rooted
+    // piece. These tests pin the plan-7c contract: report file from
+    // `start_mapped.file_id`; a span straddling pieces renders a
+    // cross-file location label with no snippet; a detail rooted in
+    // another piece renders in its own file's source block.
+
+    /// Two per-cell virtual files joined by a `Concat`, exactly as the
+    /// ipynb converter registers them. Returns the context, the concat,
+    /// and piece 1's length (the concat offset where piece 2 begins).
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+    fn concat_fixture() -> (
+        quarto_source_map::SourceContext,
+        quarto_source_map::SourceInfo,
+        usize,
+    ) {
+        let piece1 = "first cell text\n";
+        let piece2 = "second cell text\n";
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let f1 = ctx.add_file(
+            "notebook.ipynb[cell 1, markdown]".to_string(),
+            Some(piece1.to_string()),
+        );
+        let f2 = ctx.add_file(
+            "notebook.ipynb[cell 2, markdown]".to_string(),
+            Some(piece2.to_string()),
+        );
+        let concat = quarto_source_map::SourceInfo::concat(vec![
+            (
+                quarto_source_map::SourceInfo::original(f1, 0, piece1.len()),
+                piece1.len(),
+            ),
+            (
+                quarto_source_map::SourceInfo::original(f2, 0, piece2.len()),
+                piece2.len(),
+            ),
+        ]);
+        (ctx, concat, piece1.len())
+    }
+
+    /// The percent/spin shape: a `Concat` whose pieces all root to ONE
+    /// file. Must render exactly as a plain single-file diagnostic — the
+    /// fix must not disturb it.
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn ariadne_concat_single_file_pieces_passthrough() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let content = "alpha\nbeta\ngamma\n";
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let f1 = ctx.add_file("script.qmd".to_string(), Some(content.to_string()));
+        let concat = quarto_source_map::SourceInfo::concat(vec![
+            (quarto_source_map::SourceInfo::original(f1, 0, 6), 6),
+            (
+                quarto_source_map::SourceInfo::original(f1, 6, content.len()),
+                content.len() - 6,
+            ),
+        ]);
+        let location = quarto_source_map::SourceInfo::substring(concat, 6, 10); // "beta"
+        let msg = DiagnosticMessageBuilder::error("Bad chunk")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = strip_ansi_colors(&msg.to_text_with_renderer(
+            Some(&ctx),
+            &opts,
+            Some(SourceRenderer::Ariadne),
+        ));
+
+        assert!(
+            text.contains("script.qmd"),
+            "single-file passthrough must keep the file label; got:\n{text}"
+        );
+        assert!(
+            text.contains("beta"),
+            "single-file passthrough must render the snippet; got:\n{text}"
+        );
+    }
+
+    /// A main span rooted wholly in the *first* piece already renders
+    /// correctly (`root_file_id()` happens to agree with
+    /// `start_mapped.file_id`); must stay correct after the fix.
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn ariadne_concat_main_span_in_first_piece_renders_own_file() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let (ctx, concat, _) = concat_fixture();
+        let location = quarto_source_map::SourceInfo::substring(concat, 0, 5); // "first"
+        let msg = DiagnosticMessageBuilder::error("Bad cell")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = strip_ansi_colors(&msg.to_text_with_renderer(
+            Some(&ctx),
+            &opts,
+            Some(SourceRenderer::Ariadne),
+        ));
+
+        assert!(
+            text.contains("notebook.ipynb[cell 1, markdown]"),
+            "first-piece span must label piece 1; got:\n{text}"
+        );
+        assert!(
+            text.contains("first cell text"),
+            "first-piece span must show piece 1's snippet; got:\n{text}"
+        );
+        assert!(
+            !text.contains("notebook.ipynb[cell 2, markdown]"),
+            "piece 2 must not appear; got:\n{text}"
+        );
+    }
+
+    /// THE cross-piece case: a diagnostic rooted wholly in a later piece
+    /// must be labeled and snippeted from *that* piece — today it gets
+    /// piece 1's label and piece 1's content at piece-2 offsets.
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn ariadne_concat_main_span_in_later_piece_renders_own_file() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let (ctx, concat, l1) = concat_fixture();
+        let location = quarto_source_map::SourceInfo::substring(concat, l1, l1 + 6); // "second"
+        let msg = DiagnosticMessageBuilder::error("Bad cell")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = strip_ansi_colors(&msg.to_text_with_renderer(
+            Some(&ctx),
+            &opts,
+            Some(SourceRenderer::Ariadne),
+        ));
+
+        assert!(
+            text.contains("notebook.ipynb[cell 2, markdown]"),
+            "later-piece span must label the owning piece; got:\n{text}"
+        );
+        assert!(
+            text.contains("second cell text"),
+            "later-piece span must snippet the owning piece; got:\n{text}"
+        );
+        assert!(
+            !text.contains("first cell text"),
+            "the wrong piece must not render; got:\n{text}"
+        );
+    }
+
+    /// A span straddling two pieces cannot be one snippet; it must render
+    /// an explicit cross-file label naming both pieces and no snippet —
+    /// today it is silently clamped into piece 1.
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn ariadne_concat_straddling_span_labels_both_pieces_without_snippet() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let (ctx, concat, l1) = concat_fixture();
+        // Starts mid-piece-1 ("cell text…"), ends mid-piece-2 ("second").
+        let location = quarto_source_map::SourceInfo::substring(concat, 6, l1 + 6);
+        let msg = DiagnosticMessageBuilder::error("Cross-cell markdown")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = strip_ansi_colors(&msg.to_text_with_renderer(
+            Some(&ctx),
+            &opts,
+            Some(SourceRenderer::Ariadne),
+        ));
+
+        assert!(
+            text.contains("--> notebook.ipynb[cell 1, markdown]:1:7"),
+            "straddling span must name its start piece and position; got:\n{text}"
+        );
+        assert!(
+            text.contains("(spans through notebook.ipynb[cell 2, markdown]:1:7)"),
+            "straddling span must name its end piece and position; got:\n{text}"
+        );
+        assert!(
+            !text.contains("first cell text") && !text.contains("second cell text"),
+            "a cross-piece span must render no snippet; got:\n{text}"
+        );
+    }
+
+    /// A detail rooted wholly in another piece must render — in its own
+    /// file's source block — not be silently dropped.
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn ariadne_concat_detail_in_another_piece_renders_own_file() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let (ctx, concat, l1) = concat_fixture();
+        let main = quarto_source_map::SourceInfo::substring(concat.clone(), 0, 5);
+        let detail = quarto_source_map::SourceInfo::substring(concat, l1, l1 + 6);
+        let msg = DiagnosticMessageBuilder::error("Mismatch")
+            .with_location(main)
+            .add_detail_at("related token in cell 2", detail)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = strip_ansi_colors(&msg.to_text_with_renderer(
+            Some(&ctx),
+            &opts,
+            Some(SourceRenderer::Ariadne),
+        ));
+
+        assert!(
+            text.contains("notebook.ipynb[cell 1, markdown]") && text.contains("first cell text"),
+            "main span must still render; got:\n{text}"
+        );
+        assert!(
+            text.contains("notebook.ipynb[cell 2, markdown]"),
+            "foreign-piece detail must render its own block; got:\n{text}"
+        );
+        assert!(
+            text.contains("second cell text"),
+            "foreign-piece detail must snippet its own file; got:\n{text}"
+        );
+        assert!(
+            text.contains("related token in cell 2"),
+            "foreign-piece detail must keep its message; got:\n{text}"
+        );
+    }
+
+    /// Passthrough for the annotate-snippets renderer (see the ariadne
+    /// twin for the contract).
+    #[cfg(feature = "annotate-snippets")]
+    #[test]
+    fn annotate_snippets_concat_single_file_pieces_passthrough() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let content = "alpha\nbeta\ngamma\n";
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let f1 = ctx.add_file("script.qmd".to_string(), Some(content.to_string()));
+        let concat = quarto_source_map::SourceInfo::concat(vec![
+            (quarto_source_map::SourceInfo::original(f1, 0, 6), 6),
+            (
+                quarto_source_map::SourceInfo::original(f1, 6, content.len()),
+                content.len() - 6,
+            ),
+        ]);
+        let location = quarto_source_map::SourceInfo::substring(concat, 6, 10); // "beta"
+        let msg = DiagnosticMessageBuilder::error("Bad chunk")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = strip_ansi(&msg.to_text_with_renderer(
+            Some(&ctx),
+            &opts,
+            Some(SourceRenderer::AnnotateSnippets),
+        ));
+
+        assert!(
+            text.contains("script.qmd") && text.contains("beta"),
+            "single-file passthrough must render unchanged; got:\n{text}"
+        );
+    }
+
+    /// First-piece span under annotate-snippets (see the ariadne twin).
+    #[cfg(feature = "annotate-snippets")]
+    #[test]
+    fn annotate_snippets_concat_main_span_in_first_piece_renders_own_file() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let (ctx, concat, _) = concat_fixture();
+        let location = quarto_source_map::SourceInfo::substring(concat, 0, 5); // "first"
+        let msg = DiagnosticMessageBuilder::error("Bad cell")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = strip_ansi(&msg.to_text_with_renderer(
+            Some(&ctx),
+            &opts,
+            Some(SourceRenderer::AnnotateSnippets),
+        ));
+
+        assert!(
+            text.contains("notebook.ipynb[cell 1, markdown]") && text.contains("first cell text"),
+            "first-piece span must render piece 1; got:\n{text}"
+        );
+        assert!(
+            !text.contains("notebook.ipynb[cell 2, markdown]"),
+            "piece 2 must not appear; got:\n{text}"
+        );
+    }
+
+    /// Later-piece span under annotate-snippets (see the ariadne twin).
+    #[cfg(feature = "annotate-snippets")]
+    #[test]
+    fn annotate_snippets_concat_main_span_in_later_piece_renders_own_file() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let (ctx, concat, l1) = concat_fixture();
+        let location = quarto_source_map::SourceInfo::substring(concat, l1, l1 + 6); // "second"
+        let msg = DiagnosticMessageBuilder::error("Bad cell")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = strip_ansi(&msg.to_text_with_renderer(
+            Some(&ctx),
+            &opts,
+            Some(SourceRenderer::AnnotateSnippets),
+        ));
+
+        assert!(
+            text.contains("notebook.ipynb[cell 2, markdown]"),
+            "later-piece span must label the owning piece; got:\n{text}"
+        );
+        assert!(
+            text.contains("second cell text"),
+            "later-piece span must snippet the owning piece; got:\n{text}"
+        );
+        assert!(
+            !text.contains("first cell text"),
+            "the wrong piece must not render; got:\n{text}"
+        );
+    }
+
+    /// Straddling span under annotate-snippets (see the ariadne twin).
+    #[cfg(feature = "annotate-snippets")]
+    #[test]
+    fn annotate_snippets_concat_straddling_span_labels_both_pieces_without_snippet() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let (ctx, concat, l1) = concat_fixture();
+        let location = quarto_source_map::SourceInfo::substring(concat, 6, l1 + 6);
+        let msg = DiagnosticMessageBuilder::error("Cross-cell markdown")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = strip_ansi(&msg.to_text_with_renderer(
+            Some(&ctx),
+            &opts,
+            Some(SourceRenderer::AnnotateSnippets),
+        ));
+
+        assert!(
+            text.contains("--> notebook.ipynb[cell 1, markdown]:1:7"),
+            "straddling span must name its start piece and position; got:\n{text}"
+        );
+        assert!(
+            text.contains("(spans through notebook.ipynb[cell 2, markdown]:1:7)"),
+            "straddling span must name its end piece and position; got:\n{text}"
+        );
+        assert!(
+            !text.contains("first cell text") && !text.contains("second cell text"),
+            "a cross-piece span must render no snippet; got:\n{text}"
+        );
+    }
+
+    /// Foreign-piece detail under annotate-snippets (see the ariadne
+    /// twin).
+    #[cfg(feature = "annotate-snippets")]
+    #[test]
+    fn annotate_snippets_concat_detail_in_another_piece_renders_own_file() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let (ctx, concat, l1) = concat_fixture();
+        let main = quarto_source_map::SourceInfo::substring(concat.clone(), 0, 5);
+        let detail = quarto_source_map::SourceInfo::substring(concat, l1, l1 + 6);
+        let msg = DiagnosticMessageBuilder::error("Mismatch")
+            .with_location(main)
+            .add_detail_at("related token in cell 2", detail)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: false,
+        };
+        let text = strip_ansi(&msg.to_text_with_renderer(
+            Some(&ctx),
+            &opts,
+            Some(SourceRenderer::AnnotateSnippets),
+        ));
+
+        assert!(
+            text.contains("notebook.ipynb[cell 1, markdown]") && text.contains("first cell text"),
+            "main span must still render; got:\n{text}"
+        );
+        assert!(
+            text.contains("notebook.ipynb[cell 2, markdown]")
+                && text.contains("second cell text")
+                && text.contains("related token in cell 2"),
+            "foreign-piece detail must render its own block with its message; got:\n{text}"
+        );
     }
 }
