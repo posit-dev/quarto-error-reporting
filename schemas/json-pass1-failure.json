@@ -1,5 +1,47 @@
 {
   "$defs": {
+    "FileOrigin": {
+      "description": "Where a virtual file's content really comes from.\n\nAttached to a file via `FileMetadata::origin`. The canonical display\nlabel (via [`fmt::Display`]) is what diagnostics show the user; the\nstructured fields are what JSON consumers get.",
+      "oneOf": [
+        {
+          "description": "Content extracted from one cell of a computational notebook.",
+          "properties": {
+            "cell_id": {
+              "description": "The cell's `id` field (nbformat ≥ 4.5), when present.\nDisplayed in structured output only, never in text labels.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cell_index": {
+              "description": "1-based index of the cell within the notebook, counted over\nall cells regardless of type.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cell_type": {
+              "description": "The nbformat cell type (`\"code\"`, `\"markdown\"`, `\"raw\"`).",
+              "type": "string"
+            },
+            "kind": {
+              "const": "notebook_cell",
+              "type": "string"
+            },
+            "notebook_path": {
+              "description": "Path of the notebook file on disk — the hyperlink target and\nthe `file` reported in structured output.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "notebook_path",
+            "cell_index",
+            "cell_type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "JsonDiagnostic": {
       "description": "A diagnostic message in transport-friendly JSON form.\n\nLine and column numbers are 1-based to match Monaco.\n\n## `$schema` field (bd-iey8o)\n\nEach instance carries a `$schema` field pointing at\n[`JsonDiagnostic::SCHEMA_URL`] so that consumers reading the\ndiagnostic over the wire (CLI stderr, WASM bridge, preview API)\ncan discover the JSON Schema describing this shape without prior\nknowledge. The field is a static-string field with a default\nmatching the const URL — the only place `JsonDiagnostic` is\nconstructed (`diagnostic_to_json`) sets it, and downstream\ntransforms like `with_source_file` preserve it.",
       "properties": {
@@ -43,6 +85,17 @@
         },
         "kind": {
           "type": "string"
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Structured provenance for diagnostics rooted in a *virtual* file\n(plan 7c): e.g. a notebook cell carries\n`{kind: notebook_cell, notebook_path, cell_index (1-based), cell_id,\ncell_type}`. The `start_line`/`start_column` fields are relative to\nthe virtual file's own content, so a consumer needs the origin to\naddress the position the author sees — (cell, line, column) within\n`origin.notebook_path`. `None` when the diagnostic's file is a real\nfile (or unlocated), in which case the line/column fields already\nrefer to it directly."
         },
         "problem": {
           "type": [

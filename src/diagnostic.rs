@@ -860,10 +860,15 @@ impl DiagnosticMessage {
     /// OSC 8 is a terminal escape sequence that creates clickable hyperlinks:
     /// `\x1b]8;;URI\x1b\\TEXT\x1b\\`
     ///
-    /// Only adds hyperlinks if:
+    /// `path` is always the *displayed* text (for a virtual file, the
+    /// cell-qualified label). `link_target` is the disk path the hyperlink
+    /// opens — normally `path` itself when it exists on disk, or the owning
+    /// notebook for a virtual file that carries a `FileOrigin`. `None`
+    /// disables the link.
+    ///
+    /// A link is emitted only if:
     /// - Hyperlinks are enabled via the `enable_hyperlinks` parameter
-    /// - The file exists on disk (not an ephemeral in-memory file)
-    /// - The path can be converted to an absolute path
+    /// - `link_target` is `Some` and can be canonicalized
     ///
     /// The `url` crate handles:
     /// - Platform differences (Windows drive letters vs Unix paths)
@@ -873,6 +878,9 @@ impl DiagnosticMessage {
     /// Line and column numbers are added to the URL as a fragment identifier
     /// (e.g., `file:///path#line:column`), which is supported by iTerm2 3.4+
     /// and other terminal emulators for opening files at specific positions.
+    /// The fragment is emitted only when the position belongs to the linked
+    /// file itself (`link_target == path`); an origin link opens a different
+    /// file whose coordinates we cannot speak to.
     ///
     /// Returns the wrapped path if conditions are met, otherwise returns the original path.
     ///
@@ -880,7 +888,7 @@ impl DiagnosticMessage {
     #[cfg(all(feature = "ariadne", not(target_family = "wasm")))]
     fn wrap_path_with_hyperlink(
         path: &str,
-        has_disk_file: bool,
+        link_target: Option<&str>,
         line: Option<usize>,
         column: Option<usize>,
         enable_hyperlinks: bool,
@@ -890,30 +898,33 @@ impl DiagnosticMessage {
             return path.to_string();
         }
 
-        // Only add hyperlinks for real files on disk (not ephemeral in-memory files)
-        if !has_disk_file {
+        let Some(target) = link_target else {
             return path.to_string();
-        }
+        };
 
         // Canonicalize to absolute path
-        let abs_path = match std::fs::canonicalize(path) {
+        let abs_path = match std::fs::canonicalize(target) {
             Ok(p) => p,
             Err(_) => return path.to_string(), // Can't canonicalize, skip hyperlink
         };
 
         // Convert to file:// URL (handles Windows/Unix + percent-encoding)
-        let mut file_url = match url::Url::from_file_path(&abs_path) {
+        let mut file_url = match url::Url::from_file_path(Self::plain_absolute_path(abs_path)) {
             Ok(url) => url.as_str().to_string(),
             Err(_) => return path.to_string(), // Conversion failed, skip hyperlink
         };
 
         // Add line and column as fragment identifier (e.g., #line:column)
-        // This format is supported by iTerm2 3.4+ semantic history
-        if let Some(line_num) = line {
-            if let Some(col_num) = column {
-                file_url.push_str(&format!("#{}:{}", line_num, col_num));
-            } else {
-                file_url.push_str(&format!("#{}", line_num));
+        // This format is supported by iTerm2 3.4+ semantic history — but
+        // only when the position belongs to the linked file itself. An
+        // origin link opens a *different* file (the owning notebook), and
+        // the diagnostic's coordinates are relative to the virtual file.
+        if target == path
+            && let Some(line_num) = line
+        {
+            match column {
+                Some(col_num) => file_url.push_str(&format!("#{}:{}", line_num, col_num)),
+                None => file_url.push_str(&format!("#{}", line_num)),
             }
         }
 
@@ -921,12 +932,50 @@ impl DiagnosticMessage {
         format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", file_url, path)
     }
 
+    /// The absolute path to hand to `url::Url::from_file_path`.
+    ///
+    /// Gated with `wrap_path_with_hyperlink` (its only production caller);
+    /// unit tests call it so the expected URL is computed the same way the
+    /// production renderer does. Windows: `fs::canonicalize` returns
+    /// verbatim (`\\?\C:\…`) paths, which the url crate renders as
+    /// `file://?/C:/…` — no terminal can open that. Strip the verbatim
+    /// prefix (`\\?\UNC\` → `\\`) to get the plain absolute form.
+    #[cfg(all(feature = "ariadne", not(target_family = "wasm")))]
+    fn plain_absolute_path(p: std::path::PathBuf) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let s = p.as_os_str().to_string_lossy();
+            if let Some(rest) = s.strip_prefix(r#"\\?\UNC\"#) {
+                return std::path::PathBuf::from(format!(r"\\{rest}"));
+            }
+            if let Some(rest) = s.strip_prefix(r#"\\?\"#) {
+                return std::path::PathBuf::from(rest);
+            }
+        }
+        p
+    }
+
+    /// The disk path a file's label should hyperlink to: the owning
+    /// notebook for a virtual file with a `FileOrigin`, the file itself
+    /// when it exists on disk, `None` otherwise (ephemeral or missing).
+    #[cfg(feature = "ariadne")]
+    fn hyperlink_target(file: &quarto_source_map::SourceFile) -> Option<&str> {
+        match file.metadata.origin.as_ref() {
+            Some(quarto_source_map::FileOrigin::NotebookCell { notebook_path, .. }) => {
+                Some(notebook_path)
+            }
+            None => std::path::Path::new(&file.path)
+                .exists()
+                .then_some(file.path.as_str()),
+        }
+    }
+
     /// WASM version: hyperlinks don't make sense in WASM environments (no file system).
     /// Just return the path unmodified.
     #[cfg(all(feature = "ariadne", target_family = "wasm"))]
     fn wrap_path_with_hyperlink(
         path: &str,
-        _has_disk_file: bool,
+        _link_target: Option<&str>,
         _line: Option<usize>,
         _column: Option<usize>,
         _enable_hyperlinks: bool,
@@ -1032,15 +1081,16 @@ impl DiagnosticMessage {
             ));
         }
 
-        // Create display path with OSC 8 hyperlink for clickable file paths
-        // Check if this path refers to a real file on disk (vs an ephemeral in-memory file)
-        let is_disk_file = std::path::Path::new(&file.path).exists();
+        // Create display path with OSC 8 hyperlink for clickable file paths.
+        // A virtual cell file (FileOrigin) links its owning notebook; a real
+        // file links itself; an ephemeral file with no origin stays unlinked.
+        let link_target = Self::hyperlink_target(file);
         // Line and column numbers are 1-indexed for display (start_mapped.location uses 0-indexed)
         let line = Some(start_mapped.location.row + 1);
         let column = Some(start_mapped.location.column + 1);
         let display_path = Self::wrap_path_with_hyperlink(
             &file.path,
-            is_disk_file,
+            link_target,
             line,
             column,
             enable_hyperlinks,
@@ -1148,7 +1198,7 @@ impl DiagnosticMessage {
                     // the label span itself.
                     let foreign_display = Self::wrap_path_with_hyperlink(
                         &detail_file.path,
-                        std::path::Path::new(&detail_file.path).exists(),
+                        Self::hyperlink_target(detail_file),
                         None,
                         None,
                         enable_hyperlinks,
@@ -1214,8 +1264,11 @@ impl DiagnosticMessage {
 
         // Post-process to extend hyperlinks to include line:column numbers
         // Ariadne adds :line:column after our hyperlinked path, so we need to
-        // move the hyperlink end marker to include those numbers
-        if is_disk_file && enable_hyperlinks {
+        // move the hyperlink end marker to include those numbers. Only for
+        // self-links: an origin link opens a different file, and the
+        // appended coordinates are relative to the virtual file — they
+        // must not leak into the notebook URL.
+        if enable_hyperlinks && link_target == Some(file.path.as_str()) {
             Some(Self::extend_hyperlink_to_include_line_column(
                 &output_str,
                 &file.path,
@@ -2554,6 +2607,144 @@ mod tests {
                 && text.contains("second cell text")
                 && text.contains("related token in cell 2"),
             "foreign-piece detail must render its own block with its message; got:\n{text}"
+        );
+    }
+
+    // ==================== Origin-aware hyperlinks (plan 7c) ====================
+    //
+    // A virtual file carrying `FileMetadata::origin` (a notebook cell) is
+    // hyperlinked to the *owning notebook on disk*, and the `#line:column`
+    // fragment must be suppressed: origin coordinates are cell-relative and
+    // would be wrong in the notebook's URL. Without origin, a virtual file
+    // gets no hyperlink at all (its pseudo-path does not exist on disk).
+
+    /// Extract every OSC 8 link URL from raw terminal output.
+    #[cfg(feature = "ariadne")]
+    fn osc8_urls(text: &str) -> Vec<String> {
+        let mut urls = Vec::new();
+        let mut rest = text;
+        while let Some(start) = rest.find("\x1b]8;;") {
+            let after = &rest[start + 5..];
+            match after.find("\x1b\\") {
+                Some(end) => {
+                    urls.push(after[..end].to_string());
+                    rest = &after[end..];
+                }
+                None => break,
+            }
+        }
+        urls
+    }
+
+    /// A real notebook on disk plus two per-cell virtual files joined by a
+    /// `Concat`, with `origin` attached to both cells. `notebook_path` is the
+    /// absolute disk path — what q2 registers after resolving the document.
+    #[cfg(feature = "ariadne")]
+    fn origin_fixture() -> (
+        quarto_source_map::SourceContext,
+        quarto_source_map::SourceInfo,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        usize,
+    ) {
+        let piece1 = "first cell text\n";
+        let piece2 = "second cell text\n";
+        let dir = tempfile::TempDir::new().unwrap();
+        let notebook = dir.path().join("notebook.ipynb");
+        std::fs::write(&notebook, "{}").unwrap();
+        let origin_for = |index: usize| {
+            Some(quarto_source_map::FileOrigin::NotebookCell {
+                notebook_path: notebook.display().to_string(),
+                cell_index: index,
+                cell_id: None,
+                cell_type: "markdown".to_string(),
+            })
+        };
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let f1 = ctx.add_file(
+            "notebook.ipynb[cell 1, markdown]".to_string(),
+            Some(piece1.to_string()),
+        );
+        let f2 = ctx.add_file(
+            "notebook.ipynb[cell 2, markdown]".to_string(),
+            Some(piece2.to_string()),
+        );
+        ctx.get_file_mut(f1).unwrap().metadata.origin = origin_for(1);
+        ctx.get_file_mut(f2).unwrap().metadata.origin = origin_for(2);
+        let concat = quarto_source_map::SourceInfo::concat(vec![
+            (
+                quarto_source_map::SourceInfo::original(f1, 0, piece1.len()),
+                piece1.len(),
+            ),
+            (
+                quarto_source_map::SourceInfo::original(f2, 0, piece2.len()),
+                piece2.len(),
+            ),
+        ]);
+        (ctx, concat, dir, notebook, piece1.len())
+    }
+
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn ariadne_origin_cell_hyperlinks_the_owning_notebook() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let (ctx, concat, _dir, notebook, l1) = origin_fixture();
+        let location = quarto_source_map::SourceInfo::substring(concat, l1, l1 + 6); // "second"
+        let msg = DiagnosticMessageBuilder::error("Bad cell")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: true,
+        };
+        let text = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
+
+        // Compute the expected URL exactly the way the renderer does, so
+        // platform-specific path forms (Windows verbatim `\\?\…`) can't
+        // make the test diverge from production.
+        let canonical = std::fs::canonicalize(&notebook).unwrap();
+        let expected_prefix =
+            url::Url::from_file_path(super::DiagnosticMessage::plain_absolute_path(canonical))
+                .unwrap()
+                .as_str()
+                .to_string();
+        let urls = osc8_urls(&text);
+        let cell_link = urls
+            .iter()
+            .find(|u| u.starts_with(&expected_prefix))
+            .expect("cell label must hyperlink to the owning notebook");
+
+        // The fragment must be absent: origin coordinates are cell-relative
+        // and would be wrong as a notebook line/column.
+        assert!(
+            !cell_link.contains('#'),
+            "cell hyperlink must not carry a #line:col fragment; got {cell_link:?}"
+        );
+        // The human-readable label is still the cell-qualified pseudo-path.
+        assert!(
+            text.contains("notebook.ipynb[cell 2, markdown]"),
+            "label must stay the pseudo-path; got:\n{text}"
+        );
+    }
+
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn ariadne_virtual_file_without_origin_gets_no_hyperlink() {
+        use crate::builder::DiagnosticMessageBuilder;
+
+        let (ctx, concat, _l1) = concat_fixture();
+        let location = quarto_source_map::SourceInfo::substring(concat, 0, 5);
+        let msg = DiagnosticMessageBuilder::error("Bad cell")
+            .with_location(location)
+            .build();
+        let opts = TextRenderOptions {
+            enable_hyperlinks: true,
+        };
+        let text = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
+
+        assert!(
+            osc8_urls(&text).is_empty(),
+            "a virtual file whose path does not exist on disk must not be hyperlinked; got:\n{text}"
         );
     }
 }
