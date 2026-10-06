@@ -14,7 +14,11 @@ catalog lives in a separate crate that installs itself at startup.
 ## Core types
 
 - [`DiagnosticMessage`] — a diagnostic (kind, title, problem, details, hints,
-  optional code and source location). Renders to ANSI text (`to_text`) or JSON.
+  optional code and source location). Renders to terminal text (`to_text`) or
+  JSON.
+- [`TextRenderOptions`] — controls text rendering: ANSI color and OSC 8
+  hyperlinks are on by default; `TextRenderOptions::plain()` turns both off
+  for escape-free text (logs, CI, machine consumers).
 - [`DiagnosticMessageBuilder`] — a tidyverse-style builder
   (`.problem()`, `.add_detail()`, `.add_hint()`, `.with_code()`, `.with_location()`).
 - [`CatalogProvider`] — the seam an embedder implements to resolve a code to
@@ -66,7 +70,10 @@ gets code-only diagnostics, which is a valid, leaner mode.
 - `json` *(off by default)* — enables the `JsonDiagnostic` machine-readable wire
   shape and its `schemars`-generated JSON Schema. Leave it off if you only need
   the diagnostic/builder/text-render API; enable it for tooling that consumes
-  diagnostics over a wire (editors, language servers, web UIs).
+  diagnostics over a wire (editors, language servers, web UIs). The
+  pre-rendered `rendered` snippet is terminal text by default; use
+  `diagnostic_to_json_with_options(.., &TextRenderOptions::plain())` for a
+  copy with no escape sequences.
 
 ## License
 
@@ -74,6 +81,7 @@ MIT © Posit Software, PBC
 
 [`DiagnosticMessage`]: https://docs.rs/quarto-error-reporting/latest/quarto_error_reporting/struct.DiagnosticMessage.html
 [`DiagnosticMessageBuilder`]: https://docs.rs/quarto-error-reporting/latest/quarto_error_reporting/struct.DiagnosticMessageBuilder.html
+[`TextRenderOptions`]: https://docs.rs/quarto-error-reporting/latest/quarto_error_reporting/struct.TextRenderOptions.html
 [`CatalogProvider`]: https://docs.rs/quarto-error-reporting/latest/quarto_error_reporting/catalog/trait.CatalogProvider.html
 [`ErrorCodeInfo`]: https://docs.rs/quarto-error-reporting/latest/quarto_error_reporting/catalog/struct.ErrorCodeInfo.html
 [`install_catalog`]: https://docs.rs/quarto-error-reporting/latest/quarto_error_reporting/catalog/fn.install_catalog.html

@@ -32,9 +32,7 @@ fn main() {
 
     // Disable hyperlinks - useful for snapshot testing where absolute paths
     // would cause differences between machines
-    let options = TextRenderOptions {
-        enable_hyperlinks: false,
-    };
+    let options = TextRenderOptions::default().hyperlinks(false);
 
     let no_hyperlink_text = error.to_text_with_options(Some(&ctx), &options);
     println!("{}", no_hyperlink_text);
@@ -56,12 +54,23 @@ fn main() {
         no_hyperlink_text.contains("\x1b]8;")
     );
 
-    println!("\n=== Example 4: JSON output (no hyperlinks) ===\n");
+    println!("\n=== Example 4: Plain rendering (no escape sequences) ===\n");
+
+    // `TextRenderOptions::plain()` disables both ANSI color and OSC 8
+    // hyperlinks - for logs, CI output, and other machine consumers.
+    let plain_text = error.to_text_with_options(Some(&ctx), &TextRenderOptions::plain());
+    println!("{}", plain_text);
+    println!(
+        "  Contains any escape byte: {}",
+        plain_text.contains('\x1b')
+    );
+
+    println!("\n=== Example 5: JSON output (no hyperlinks) ===\n");
 
     let json = error.to_json();
     println!("{}", serde_json::to_string_pretty(&json).unwrap());
 
-    println!("\n=== Example 5: Multiple diagnostics with custom rendering ===\n");
+    println!("\n=== Example 6: Multiple diagnostics with custom rendering ===\n");
 
     let error2 = DiagnosticMessageBuilder::error("Type mismatch")
         .with_code("Q-1-15")
@@ -79,9 +88,7 @@ fn main() {
     let errors = [error, error2, error3];
 
     // Render all with consistent options
-    let no_hyperlinks = TextRenderOptions {
-        enable_hyperlinks: false,
-    };
+    let no_hyperlinks = TextRenderOptions::default().hyperlinks(false);
 
     for (i, err) in errors.iter().enumerate() {
         println!("Error {}:", i + 1);

@@ -519,9 +519,7 @@ mod tests {
         let loc = original(1, 100, 110);
         let input = vec![(PathBuf::from("a.qmd"), diag_at(loc, "T"), None)];
         let groups = coalesce_by_source(input);
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = groups[0].to_text_with_options(&opts);
         assert!(
             !text.contains("Affected files:"),
@@ -538,9 +536,7 @@ mod tests {
             (PathBuf::from("b.qmd"), diag_at(loc.clone(), "T"), None),
         ];
         let groups = coalesce_by_source(input);
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = groups[0].to_text_with_options(&opts);
         assert!(text.contains("Affected files: a.qmd, b.qmd"), "{}", text);
         assert!(
@@ -566,9 +562,7 @@ mod tests {
             })
             .collect();
         let groups = coalesce_by_source(input);
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = groups[0].to_text_with_options(&opts);
         assert!(
             text.contains("Affected files: a.qmd, b.qmd, c.qmd (and 2 others)"),
@@ -592,9 +586,7 @@ mod tests {
             })
             .collect();
         let groups = coalesce_by_source(input);
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = groups[0].to_text_with_options(&opts);
         assert!(
             text.contains("(and 1 other)"),
