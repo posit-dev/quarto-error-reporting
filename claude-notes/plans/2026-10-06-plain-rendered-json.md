@@ -171,8 +171,11 @@ has no escape bytes. Then regenerate both schemas with
       non_exhaustive); `Cargo.lock`
 - [x] `cargo fmt --all`; `cargo xtask verify` (all 6 checks green); final
       golden compare 120/120 byte-identical; temporary harness deleted
-- [ ] PR; after the release, comment on qe-hal9cc7b with the q2 migration
-      note (11 struct-literal sites → builder) for bd-ckbqmupi
+- [x] PR; after the release, comment on qe-hal9cc7b with the q2 migration
+      note (11 struct-literal sites → builder) for bd-ckbqmupi. PR #9 merged
+      as 24a6ad4 (2026-10-06); the Release workflow published 0.4.0 to
+      crates.io and created tag/GitHub Release v0.4.0. Migration note posted
+      and qe-hal9cc7b closed.
 
 ## Decisions (2026-10-06)
 
