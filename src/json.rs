@@ -21,14 +21,18 @@
 //! * [`JsonPass1Failure`] — sibling-page parse failure (bd-rqba).
 //! * [`diagnostic_to_json`] — `DiagnosticMessage → JsonDiagnostic`,
 //!   resolving byte offsets to 1-based line/column via
-//!   [`SourceContext`].
+//!   [`SourceContext`]. `rendered` carries ANSI color and OSC 8
+//!   hyperlinks (terminal text).
+//! * [`diagnostic_to_json_with_options`] — the same, rendering
+//!   `rendered` with caller-chosen [`TextRenderOptions`]; pass
+//!   [`TextRenderOptions::plain`] for text free of escape sequences.
 //! * [`with_source_file`] — tag a `JsonDiagnostic` with the file
 //!   it came from (used by sibling Pass-1 failures, see bd-rqba).
 
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::diagnostic::{DetailKind, DiagnosticKind, DiagnosticMessage};
+use crate::diagnostic::{DetailKind, DiagnosticKind, DiagnosticMessage, TextRenderOptions};
 use quarto_source_map::SourceContext;
 
 /// One detail item in a [`JsonDiagnostic`].
@@ -94,16 +98,26 @@ pub struct JsonDiagnostic {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_file: Option<String>,
     pub details: Vec<JsonDiagnosticDetail>,
-    /// Pre-rendered ariadne source-context snippet (bd-352bh).
+    /// Pre-rendered source-context snippet (bd-352bh), drawn by the
+    /// crate's snippet renderer (ariadne or annotate-snippets).
     /// Populated when the diagnostic carries a `location` and the
     /// converting site has a [`SourceContext`] to draw from
-    /// (i.e. always, in [`diagnostic_to_json`]). Same text the
-    /// `q2 render` CLI prints to stdout — ANSI-coded; strip on the
-    /// JS side for browser display. Consumers can render this
-    /// verbatim in a `<pre>` block for the rich source-context
-    /// view, or ignore it and fall back to the structured fields
-    /// for a compact summary. `None` for unlocated diagnostics
-    /// (rare but possible for project-level errors with no span).
+    /// (i.e. always, in [`diagnostic_to_json`]).
+    ///
+    /// Two modes, chosen by the producer:
+    ///
+    /// * **Terminal** (the default, [`diagnostic_to_json`]): the same
+    ///   text a terminal shows — ANSI color codes and OSC 8 hyperlinks;
+    ///   strip them for non-terminal display (e.g. in a browser).
+    /// * **Plain** ([`diagnostic_to_json_with_options`] with
+    ///   `TextRenderOptions::plain()`): the same layout with no escape
+    ///   sequences of any kind, readable as-is by machine consumers.
+    ///
+    /// Consumers can render this verbatim in a `<pre>` block for the
+    /// rich source-context view, or ignore it and fall back to the
+    /// structured fields for a compact summary. `None` for unlocated
+    /// diagnostics (rare but possible for project-level errors with no
+    /// span).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rendered: Option<String>,
     /// Structured provenance for diagnostics rooted in a *virtual* file
@@ -173,7 +187,46 @@ impl JsonPass1Failure {
 /// Convert a [`DiagnosticMessage`] to a [`JsonDiagnostic`], using
 /// the [`SourceContext`] to map byte offsets to 1-based
 /// line/column numbers.
+///
+/// `rendered` uses [`TextRenderOptions::default`]: ANSI color and OSC 8
+/// hyperlinks, i.e. the text a terminal would show. Use
+/// [`diagnostic_to_json_with_options`] to choose otherwise.
 pub fn diagnostic_to_json(diag: &DiagnosticMessage, ctx: &SourceContext) -> JsonDiagnostic {
+    diagnostic_to_json_with_options(diag, ctx, &TextRenderOptions::default())
+}
+
+/// Like [`diagnostic_to_json`], but renders the `rendered` field with the
+/// given [`TextRenderOptions`]. Every other field is independent of
+/// `options`.
+///
+/// Pass [`TextRenderOptions::plain`] for machine consumers (jq pipelines,
+/// agents, CI logs): `rendered` then contains no escape sequences of any
+/// kind.
+///
+/// # Example
+///
+/// ```
+/// use quarto_error_reporting::{
+///     DiagnosticMessageBuilder, TextRenderOptions, diagnostic_to_json_with_options,
+/// };
+/// use quarto_source_map::{SourceContext, SourceInfo};
+///
+/// let mut ctx = SourceContext::new();
+/// let file = ctx.add_file("doc.qmd".into(), Some("title: [oops\n".into()));
+/// let diag = DiagnosticMessageBuilder::error("Unclosed bracket")
+///     .with_location(SourceInfo::original(file, 7, 8))
+///     .build();
+///
+/// let json = diagnostic_to_json_with_options(&diag, &ctx, &TextRenderOptions::plain());
+/// let rendered = json.rendered.expect("located diagnostics are pre-rendered");
+/// assert!(rendered.contains("Unclosed bracket"));
+/// assert!(!rendered.contains('\x1b'));
+/// ```
+pub fn diagnostic_to_json_with_options(
+    diag: &DiagnosticMessage,
+    ctx: &SourceContext,
+    options: &TextRenderOptions,
+) -> JsonDiagnostic {
     // Map the main location. The mapped start is kept for the origin
     // lookup below (the file the diagnostic is rooted in carries the
     // provenance).
@@ -280,18 +333,18 @@ pub fn diagnostic_to_json(diag: &DiagnosticMessage, ctx: &SourceContext) -> Json
         .and_then(|s| ctx.get_file(s.file_id))
         .and_then(|f| f.metadata.origin.clone());
 
-    // bd-352bh: pre-render the ariadne source-context snippet for
-    // diagnostics that have a location. `DiagnosticMessage::to_text`
-    // delegates to ariadne when both the diagnostic's location AND
-    // the supplied `SourceContext` are present (see
-    // `crates/quarto-error-reporting/src/diagnostic.rs`'s
-    // `to_text_with_options`); for locationless diagnostics the
+    // bd-352bh: pre-render the source-context snippet for diagnostics
+    // that have a location, honoring the caller's `options` (color /
+    // hyperlinks). `DiagnosticMessage::to_text_with_options` delegates
+    // to the snippet renderer when both the diagnostic's location AND
+    // the supplied `SourceContext` are present (see `diagnostic.rs`'s
+    // `to_text_with_renderer`); for locationless diagnostics the
     // function would produce a tidyverse text block instead, which
     // duplicates what the structured fields already carry. So we
     // gate on `diag.location.is_some()` to avoid shipping that
     // redundant text on the wire.
     let rendered = if diag.location.is_some() {
-        Some(diag.to_text(Some(ctx)))
+        Some(diag.to_text_with_options(Some(ctx), options))
     } else {
         None
     };
@@ -582,6 +635,117 @@ mod tests {
         assert!(
             !serialized.contains("\"origin\""),
             "None origin must be omitted from the wire shape: {serialized}",
+        );
+    }
+
+    // ==================== Plain `rendered` (qe-hal9cc7b) ====================
+
+    /// A diagnostic in a real on-disk file, which the ariadne renderer
+    /// hyperlinks under default options. The `TempDir` keeps it alive.
+    fn real_file_diag() -> (DiagnosticMessage, SourceContext, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("real.qmd");
+        std::fs::write(&path, "title: [oops\n").unwrap();
+        let mut ctx = SourceContext::new();
+        let file_id = ctx.add_file(path.display().to_string(), None);
+        let mut diag = DiagnosticMessage::error("Unclosed bracket").with_code("Q-9-9");
+        diag.location = Some(quarto_source_map::SourceInfo::original(file_id, 7, 8));
+        (diag, ctx, dir)
+    }
+
+    #[test]
+    fn plain_rendered_contains_no_escape_bytes() {
+        let (real_diag, real_ctx, _dir) = real_file_diag();
+        let fixtures = [
+            ("in_memory", synth_located_diag()),
+            ("notebook_cell", cell_located_diag()),
+            ("real_file", (real_diag, real_ctx)),
+        ];
+        for (name, (diag, ctx)) in &fixtures {
+            let plain = diagnostic_to_json_with_options(diag, ctx, &TextRenderOptions::plain());
+            // Check the raw `String` for the escape byte: in serialized
+            // JSON an escape appears as the six characters `\u001b`, which
+            // a byte search would not find.
+            let rendered = plain.rendered.as_deref().expect("located → rendered");
+            assert!(
+                !rendered.contains('\u{1b}'),
+                "{name}: plain `rendered` must contain no escape byte; got {rendered:?}"
+            );
+            assert!(rendered.contains(&diag.title), "{name}: {rendered:?}");
+            // And the wire form carries no escaped escape either.
+            let wire = serde_json::to_string(&plain).unwrap();
+            assert!(
+                !wire.contains("\\u001b"),
+                "{name}: plain JSON must carry no escaped ESC; got {wire}"
+            );
+
+            // The default still renders for a terminal (when a snippet
+            // renderer is compiled in; without one, `rendered` is the
+            // escape-free structured text either way).
+            #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+            {
+                let default = diagnostic_to_json(diag, ctx);
+                assert!(
+                    default.rendered.as_deref().unwrap().contains("\u{1b}["),
+                    "{name}: default `rendered` keeps ANSI color"
+                );
+            }
+        }
+    }
+
+    /// The ariadne default hyperlinks a real file; plain must not.
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn plain_rendered_drops_hyperlinks_that_default_emits() {
+        let (diag, ctx, _dir) = real_file_diag();
+        let default = diagnostic_to_json(&diag, &ctx);
+        assert!(
+            default.rendered.as_deref().unwrap().contains("\u{1b}]8;"),
+            "default `rendered` keeps OSC 8 for a real file"
+        );
+        let plain = diagnostic_to_json_with_options(&diag, &ctx, &TextRenderOptions::plain());
+        assert!(!plain.rendered.as_deref().unwrap().contains('\u{1b}'));
+    }
+
+    /// Render options affect `rendered` only; every other field is
+    /// identical between the default and plain conversions.
+    #[test]
+    fn render_options_affect_only_rendered() {
+        let (real_diag, real_ctx, _dir) = real_file_diag();
+        let fixtures = [
+            synth_located_diag(),
+            cell_located_diag(),
+            (real_diag, real_ctx),
+        ];
+        for (diag, ctx) in &fixtures {
+            let without_rendered = |json: JsonDiagnostic| {
+                let mut value = serde_json::to_value(json).unwrap();
+                value.as_object_mut().unwrap().remove("rendered");
+                value
+            };
+            assert_eq!(
+                without_rendered(diagnostic_to_json(diag, ctx)),
+                without_rendered(diagnostic_to_json_with_options(
+                    diag,
+                    ctx,
+                    &TextRenderOptions::plain()
+                )),
+            );
+        }
+    }
+
+    /// `diagnostic_to_json` is exactly the default-options conversion.
+    #[test]
+    fn diagnostic_to_json_uses_default_options() {
+        let (diag, ctx, _dir) = real_file_diag();
+        assert_eq!(
+            serde_json::to_value(diagnostic_to_json(&diag, &ctx)).unwrap(),
+            serde_json::to_value(diagnostic_to_json_with_options(
+                &diag,
+                &ctx,
+                &TextRenderOptions::default()
+            ))
+            .unwrap(),
         );
     }
 }

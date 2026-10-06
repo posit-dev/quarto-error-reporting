@@ -32,9 +32,7 @@ fn main() {
         .build();
 
     // Disable hyperlinks so the output is path-stable in a demo.
-    let opts = TextRenderOptions {
-        enable_hyperlinks: false,
-    };
+    let opts = TextRenderOptions::default().hyperlinks(false);
 
     // `None` uses the default renderer for the enabled features.
     println!("=== default renderer (None) ===\n");

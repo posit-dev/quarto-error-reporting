@@ -91,5 +91,6 @@ pub use diagnostic::{
 };
 #[cfg(feature = "json")]
 pub use json::{
-    JsonDiagnostic, JsonDiagnosticDetail, JsonPass1Failure, diagnostic_to_json, with_source_file,
+    JsonDiagnostic, JsonDiagnosticDetail, JsonPass1Failure, diagnostic_to_json,
+    diagnostic_to_json_with_options, with_source_file,
 };

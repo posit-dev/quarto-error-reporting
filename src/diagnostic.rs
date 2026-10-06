@@ -39,8 +39,34 @@ pub enum DetailKind {
 /// Options for rendering diagnostic messages to text.
 ///
 /// This struct controls various aspects of text rendering, such as whether
-/// to include terminal hyperlinks for clickable file paths.
+/// to include terminal hyperlinks for clickable file paths or ANSI color in
+/// the source-context snippet.
+///
+/// The default enables everything a terminal can use (color and OSC 8
+/// hyperlinks). [`TextRenderOptions::plain`] disables both, producing text
+/// with no escape sequences of any kind — for logs, JSON transport, and
+/// other machine consumers.
+///
+/// The struct is `#[non_exhaustive]`: construct it from
+/// [`TextRenderOptions::default`] or [`TextRenderOptions::plain`] and adjust
+/// it with the builder methods, so new options can be added without
+/// breaking callers.
+///
+/// # Example
+///
+/// ```
+/// use quarto_error_reporting::TextRenderOptions;
+///
+/// // Terminal output without hyperlinks (e.g. for snapshot tests).
+/// let opts = TextRenderOptions::default().hyperlinks(false);
+/// assert!(opts.enable_color && !opts.enable_hyperlinks);
+///
+/// // No escape sequences at all.
+/// let plain = TextRenderOptions::plain();
+/// assert!(!plain.enable_color && !plain.enable_hyperlinks);
+/// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TextRenderOptions {
     /// Enable OSC 8 hyperlinks for clickable file paths in terminals.
     ///
@@ -48,13 +74,46 @@ pub struct TextRenderOptions {
     /// escape codes for clickable links (supported by iTerm2, VS Code, etc.).
     /// Disable for snapshot testing to avoid absolute path differences.
     pub enable_hyperlinks: bool,
+    /// Enable ANSI (SGR) color codes in the source-context snippet.
+    ///
+    /// When disabled, the snippet renderer draws the same layout with no
+    /// color escape sequences. Independent of
+    /// [`enable_hyperlinks`](Self::enable_hyperlinks): disable both (see
+    /// [`TextRenderOptions::plain`]) for output free of escape bytes.
+    pub enable_color: bool,
 }
 
 impl Default for TextRenderOptions {
     fn default() -> Self {
         Self {
             enable_hyperlinks: true,
+            enable_color: true,
         }
+    }
+}
+
+impl TextRenderOptions {
+    /// Options producing text with no escape sequences of any kind: no ANSI
+    /// color and no OSC 8 hyperlinks.
+    pub fn plain() -> Self {
+        Self {
+            enable_hyperlinks: false,
+            enable_color: false,
+        }
+    }
+
+    /// Set whether file paths carry OSC 8 hyperlinks
+    /// (see [`enable_hyperlinks`](Self::enable_hyperlinks)).
+    pub fn hyperlinks(mut self, enable: bool) -> Self {
+        self.enable_hyperlinks = enable;
+        self
+    }
+
+    /// Set whether the source-context snippet carries ANSI color
+    /// (see [`enable_color`](Self::enable_color)).
+    pub fn color(mut self, enable: bool) -> Self {
+        self.enable_color = enable;
+        self
     }
 }
 
@@ -436,7 +495,7 @@ impl DiagnosticMessage {
     ///     .build();
     ///
     /// // Disable hyperlinks for snapshot testing
-    /// let options = TextRenderOptions { enable_hyperlinks: false };
+    /// let options = TextRenderOptions::default().hyperlinks(false);
     /// let text = msg.to_text_with_options(None, &options);
     /// assert!(text.contains("Error: Invalid input"));
     /// ```
@@ -504,7 +563,7 @@ impl DiagnosticMessage {
 
             if let Some(loc) = location {
                 if let Some(snippet_output) =
-                    self.render_source_context(loc, ctx_val, options.enable_hyperlinks, renderer)
+                    self.render_source_context(loc, ctx_val, options, renderer)
                 {
                     result.push_str(&snippet_output);
                     true
@@ -839,18 +898,18 @@ impl DiagnosticMessage {
         &self,
         main_location: &quarto_source_map::SourceInfo,
         ctx: &quarto_source_map::SourceContext,
-        enable_hyperlinks: bool,
+        options: &TextRenderOptions,
         renderer: Option<SourceRenderer>,
     ) -> Option<String> {
         let renderer = renderer.or_else(SourceRenderer::default_for_features)?;
         match renderer {
             #[cfg(feature = "ariadne")]
             SourceRenderer::Ariadne => {
-                self.render_ariadne_source_context(main_location, ctx, enable_hyperlinks)
+                self.render_ariadne_source_context(main_location, ctx, options)
             }
             #[cfg(feature = "annotate-snippets")]
             SourceRenderer::AnnotateSnippets => {
-                self.render_annotate_snippets_source_context(main_location, ctx, enable_hyperlinks)
+                self.render_annotate_snippets_source_context(main_location, ctx, options)
             }
         }
     }
@@ -1013,14 +1072,20 @@ impl DiagnosticMessage {
     ///
     /// This produces the visual source code snippet with highlighting.
     /// The tidyverse-style problem/details/hints are added separately by to_text().
+    ///
+    /// With `options.enable_color` off, no SGR escapes are emitted:
+    /// `Config::with_color(false)` disables ariadne's own colors and also
+    /// strips the color from each label as it is added to the report.
     #[cfg(feature = "ariadne")]
     fn render_ariadne_source_context(
         &self,
         main_location: &quarto_source_map::SourceInfo,
         ctx: &quarto_source_map::SourceContext,
-        enable_hyperlinks: bool,
+        options: &TextRenderOptions,
     ) -> Option<String> {
         use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, Source};
+
+        let enable_hyperlinks = options.enable_hyperlinks;
 
         // Mirror of ariadne's private `Config::unimportant_color()` from
         // ariadne 0.6.0 (`src/lib.rs:543`). We use this for `DetailKind::Faded`
@@ -1114,11 +1179,20 @@ impl DiagnosticMessage {
 
         // Build the report using the mapped offset for proper line:column display
         // IMPORTANT: Use IndexType::Byte because our offsets are byte offsets, not character offsets
+        //
+        // The config must be set before any label is added: ariadne applies
+        // the config's color switch to each label's color at `add_label`
+        // time (ariadne 0.6.0 `Report::add_labels`), so labels added under
+        // the default config would keep their colors with color off.
         let mut report = Report::build(
             report_kind,
             (display_path.clone(), main_span.start..main_span.start),
         )
-        .with_config(Config::default().with_index_type(IndexType::Byte));
+        .with_config(
+            Config::default()
+                .with_index_type(IndexType::Byte)
+                .with_color(options.enable_color),
+        );
 
         // Add title with error code
         if let Some(code) = &self.code {
@@ -1288,7 +1362,9 @@ impl DiagnosticMessage {
     /// - The error code is rendered natively via `Title::id` (e.g.
     ///   `error[Q-2-5]: …`) rather than prefixed into the message.
     /// - There are **no terminal hyperlinks** — annotate-snippets has no
-    ///   OSC 8 support, so `_enable_hyperlinks` is ignored.
+    ///   OSC 8 support, so `options.enable_hyperlinks` is ignored.
+    ///   `options.enable_color` selects `Renderer::styled()` (ANSI) or
+    ///   `Renderer::plain()` (no escape sequences).
     /// - Detail labels are all rendered as `Context` annotations
     ///   (annotate-snippets has no per-label color), so the `DetailKind`
     ///   color distinction and the `Faded` blend are not reproduced.
@@ -1300,7 +1376,7 @@ impl DiagnosticMessage {
         &self,
         main_location: &quarto_source_map::SourceInfo,
         ctx: &quarto_source_map::SourceContext,
-        _enable_hyperlinks: bool,
+        options: &TextRenderOptions,
     ) -> Option<String> {
         use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
 
@@ -1442,7 +1518,12 @@ impl DiagnosticMessage {
         // `to_text` appends unlocated details and hints directly after the
         // excerpt with `writeln!`. Match the ariadne path (which ends in a
         // newline) so those lines don't glue onto the last source row.
-        let mut rendered = Renderer::styled().render(&[group]);
+        let renderer = if options.enable_color {
+            Renderer::styled()
+        } else {
+            Renderer::plain()
+        };
+        let mut rendered = renderer.render(&[group]);
         if !rendered.ends_with('\n') {
             rendered.push('\n');
         }
@@ -1771,9 +1852,7 @@ mod tests {
         let with_hyperlinks = msg.to_text(Some(&ctx));
 
         // With hyperlinks disabled
-        let options = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let options = TextRenderOptions::default().hyperlinks(false);
         let without_hyperlinks = msg.to_text_with_options(Some(&ctx), &options);
 
         // When hyperlinks are disabled, output should be different
@@ -1805,9 +1884,7 @@ mod tests {
             .add_hint("Try this")
             .build();
 
-        let options = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let options = TextRenderOptions::default().hyperlinks(false);
 
         let text = msg.to_text_with_options(None, &options);
 
@@ -1860,9 +1937,7 @@ mod tests {
             .problem("this is wrong")
             .build();
 
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let raw =
             msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::AnnotateSnippets));
         let text = strip_ansi(&raw);
@@ -1986,9 +2061,7 @@ mod tests {
             .with_location(location)
             .build();
 
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
 
         assert!(
@@ -2032,9 +2105,7 @@ mod tests {
             .with_location(location)
             .build();
 
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text =
             msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::AnnotateSnippets));
 
@@ -2105,9 +2176,7 @@ mod tests {
             .with_code("Q-2-9")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
         let stripped = strip_ansi_colors(&text);
 
@@ -2154,9 +2223,7 @@ mod tests {
             .with_code("Q-2-9")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text =
             msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::AnnotateSnippets));
         let stripped = strip_ansi_colors(&text);
@@ -2190,9 +2257,7 @@ mod tests {
         let msg = DiagnosticMessageBuilder::error("Pick a style")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
 
         let ariadne = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
         let snippets =
@@ -2272,9 +2337,7 @@ mod tests {
         let msg = DiagnosticMessageBuilder::error("Bad chunk")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = strip_ansi_colors(&msg.to_text_with_renderer(
             Some(&ctx),
             &opts,
@@ -2304,9 +2367,7 @@ mod tests {
         let msg = DiagnosticMessageBuilder::error("Bad cell")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = strip_ansi_colors(&msg.to_text_with_renderer(
             Some(&ctx),
             &opts,
@@ -2340,9 +2401,7 @@ mod tests {
         let msg = DiagnosticMessageBuilder::error("Bad cell")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = strip_ansi_colors(&msg.to_text_with_renderer(
             Some(&ctx),
             &opts,
@@ -2377,9 +2436,7 @@ mod tests {
         let msg = DiagnosticMessageBuilder::error("Cross-cell markdown")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = strip_ansi_colors(&msg.to_text_with_renderer(
             Some(&ctx),
             &opts,
@@ -2414,9 +2471,7 @@ mod tests {
             .with_location(main)
             .add_detail_at("related token in cell 2", detail)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = strip_ansi_colors(&msg.to_text_with_renderer(
             Some(&ctx),
             &opts,
@@ -2462,9 +2517,7 @@ mod tests {
         let msg = DiagnosticMessageBuilder::error("Bad chunk")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = strip_ansi(&msg.to_text_with_renderer(
             Some(&ctx),
             &opts,
@@ -2488,9 +2541,7 @@ mod tests {
         let msg = DiagnosticMessageBuilder::error("Bad cell")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = strip_ansi(&msg.to_text_with_renderer(
             Some(&ctx),
             &opts,
@@ -2518,9 +2569,7 @@ mod tests {
         let msg = DiagnosticMessageBuilder::error("Bad cell")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = strip_ansi(&msg.to_text_with_renderer(
             Some(&ctx),
             &opts,
@@ -2552,9 +2601,7 @@ mod tests {
         let msg = DiagnosticMessageBuilder::error("Cross-cell markdown")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = strip_ansi(&msg.to_text_with_renderer(
             Some(&ctx),
             &opts,
@@ -2589,9 +2636,7 @@ mod tests {
             .with_location(main)
             .add_detail_at("related token in cell 2", detail)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: false,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(false);
         let text = strip_ansi(&msg.to_text_with_renderer(
             Some(&ctx),
             &opts,
@@ -2639,7 +2684,7 @@ mod tests {
     /// A real notebook on disk plus two per-cell virtual files joined by a
     /// `Concat`, with `origin` attached to both cells. `notebook_path` is the
     /// absolute disk path — what q2 registers after resolving the document.
-    #[cfg(feature = "ariadne")]
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
     fn origin_fixture() -> (
         quarto_source_map::SourceContext,
         quarto_source_map::SourceInfo,
@@ -2694,9 +2739,7 @@ mod tests {
         let msg = DiagnosticMessageBuilder::error("Bad cell")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: true,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(true);
         let text = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
 
         // Compute the expected URL exactly the way the renderer does, so
@@ -2737,14 +2780,225 @@ mod tests {
         let msg = DiagnosticMessageBuilder::error("Bad cell")
             .with_location(location)
             .build();
-        let opts = TextRenderOptions {
-            enable_hyperlinks: true,
-        };
+        let opts = TextRenderOptions::default().hyperlinks(true);
         let text = msg.to_text_with_renderer(Some(&ctx), &opts, Some(SourceRenderer::Ariadne));
 
         assert!(
             osc8_urls(&text).is_empty(),
             "a virtual file whose path does not exist on disk must not be hyperlinked; got:\n{text}"
         );
+    }
+
+    // ==================== Plain rendering (qe-hal9cc7b) ====================
+    //
+    // `TextRenderOptions::plain()` must produce text with no escape byte at
+    // all — no SGR color, no OSC 8 — from either renderer, including for
+    // files that *would* be hyperlinked. Assertions are on the raw `String`
+    // (a `\x1b` byte), never on serialized JSON, where escapes appear as
+    // `\u001b` and a byte search cannot see them.
+
+    /// The renderers compiled into this build.
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+    fn available_renderers() -> Vec<SourceRenderer> {
+        vec![
+            #[cfg(feature = "ariadne")]
+            SourceRenderer::Ariadne,
+            #[cfg(feature = "annotate-snippets")]
+            SourceRenderer::AnnotateSnippets,
+        ]
+    }
+
+    /// One located diagnostic per rendering shape that emits color or
+    /// hyperlinks: every detail kind (including the faded mirror color),
+    /// a real on-disk file (self-hyperlinked), a notebook cell with a
+    /// detail in another piece (origin-hyperlinked foreign section), and a
+    /// cross-piece span. Each entry carries a source excerpt that proves
+    /// the snippet renderer actually ran. The `TempDir`s keep the on-disk
+    /// files alive for the caller.
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+    #[allow(clippy::type_complexity)]
+    fn escape_fixtures() -> (
+        Vec<(
+            &'static str,
+            quarto_source_map::SourceContext,
+            DiagnosticMessage,
+            &'static str,
+        )>,
+        Vec<tempfile::TempDir>,
+    ) {
+        use crate::builder::DiagnosticMessageBuilder;
+        use quarto_source_map::SourceInfo;
+
+        let mut fixtures = Vec::new();
+        let mut dirs = Vec::new();
+
+        // Ephemeral file; every detail kind, plus unlocated detail and hint.
+        let content = "> quoted one\n> quoted two\nplain line\n";
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let f = ctx.add_file("test.qmd".to_string(), Some(content.to_string()));
+        let msg = DiagnosticMessageBuilder::error("Every detail kind")
+            .with_code("Q-9-9")
+            .with_location(SourceInfo::original(f, 0, 25))
+            .problem("the span is wrong")
+            .add_detail_at("error detail", SourceInfo::original(f, 2, 8))
+            .add_info_at("info detail", SourceInfo::original(f, 26, 31))
+            .add_note_at("note detail", SourceInfo::original(f, 15, 21))
+            .add_faded_at("", SourceInfo::original(f, 13, 15))
+            .add_detail("unlocated detail")
+            .add_hint("a hint")
+            .build();
+        fixtures.push(("detail_kinds", ctx, msg, "quoted two"));
+
+        // Real file on disk: ariadne hyperlinks it under default options.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("real.qmd");
+        std::fs::write(&path, "title: [oops\n").unwrap();
+        let mut ctx = quarto_source_map::SourceContext::new();
+        let f = ctx.add_file(path.display().to_string(), None);
+        let msg = DiagnosticMessageBuilder::warning("Real file")
+            .with_location(SourceInfo::original(f, 7, 12))
+            .build();
+        fixtures.push(("real_file", ctx, msg, "title: [oops"));
+        dirs.push(dir);
+
+        // Notebook cells with origin; a detail rooted in the other cell
+        // renders as its own (hyperlinked, colored) source section.
+        let (ctx, concat, dir, _notebook, l1) = origin_fixture();
+        let msg = DiagnosticMessageBuilder::error("Bad cell")
+            .with_location(SourceInfo::substring(concat.clone(), 0, 5))
+            .add_detail_at("in cell 2", SourceInfo::substring(concat, l1, l1 + 6))
+            .build();
+        fixtures.push(("notebook_origin", ctx, msg, "second cell text"));
+        dirs.push(dir);
+
+        // A span straddling two pieces renders as a textual location.
+        let (ctx, concat, l1) = concat_fixture();
+        let msg = DiagnosticMessageBuilder::error("Straddles")
+            .with_location(SourceInfo::substring(concat, l1 - 5, l1 + 6))
+            .build();
+        fixtures.push(("cross_piece", ctx, msg, "cell 2"));
+
+        (fixtures, dirs)
+    }
+
+    #[test]
+    fn plain_constructor_disables_color_and_hyperlinks() {
+        let plain = TextRenderOptions::plain();
+        assert!(!plain.enable_color && !plain.enable_hyperlinks);
+        let default = TextRenderOptions::default();
+        assert!(default.enable_color && default.enable_hyperlinks);
+        let mixed = TextRenderOptions::plain().hyperlinks(true);
+        assert!(!mixed.enable_color && mixed.enable_hyperlinks);
+        let mixed = TextRenderOptions::default().color(false);
+        assert!(!mixed.enable_color && mixed.enable_hyperlinks);
+    }
+
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+    #[test]
+    fn plain_rendering_contains_no_escape_bytes() {
+        let (fixtures, _dirs) = escape_fixtures();
+        for renderer in available_renderers() {
+            for (name, ctx, msg, excerpt) in &fixtures {
+                let text = msg.to_text_with_renderer(
+                    Some(ctx),
+                    &TextRenderOptions::plain(),
+                    Some(renderer),
+                );
+                assert!(
+                    !text.contains('\u{1b}'),
+                    "{renderer:?}/{name}: plain output must contain no escape byte; got:\n{text:?}"
+                );
+                assert!(
+                    text.contains(excerpt),
+                    "{renderer:?}/{name}: the snippet renderer must have run; got:\n{text}"
+                );
+            }
+        }
+    }
+
+    /// Plain is the same layout as the colored rendering, minus the color:
+    /// stripping SGR codes from the colored text yields the plain text
+    /// byte for byte. Hyperlinks are off on both sides (they're a separate
+    /// knob, tested below).
+    #[cfg(any(feature = "ariadne", feature = "annotate-snippets"))]
+    #[test]
+    fn plain_rendering_matches_colored_rendering_stripped() {
+        let (fixtures, _dirs) = escape_fixtures();
+        let colored_opts = TextRenderOptions::default().hyperlinks(false);
+        for renderer in available_renderers() {
+            for (name, ctx, msg, _) in &fixtures {
+                let colored = msg.to_text_with_renderer(Some(ctx), &colored_opts, Some(renderer));
+                let plain = msg.to_text_with_renderer(
+                    Some(ctx),
+                    &TextRenderOptions::plain(),
+                    Some(renderer),
+                );
+                assert_eq!(
+                    strip_ansi_colors(&colored),
+                    plain,
+                    "{renderer:?}/{name}: plain must equal the colored rendering minus SGR codes"
+                );
+            }
+        }
+    }
+
+    /// The default (terminal) rendering is unchanged: it still carries SGR
+    /// color and, for a hyperlinkable file, OSC 8.
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn default_rendering_keeps_color_and_hyperlinks() {
+        let (fixtures, _dirs) = escape_fixtures();
+        let (_, ctx, msg, _) = fixtures.iter().find(|f| f.0 == "real_file").unwrap();
+        let text = msg.to_text_with_renderer(
+            Some(ctx),
+            &TextRenderOptions::default(),
+            Some(SourceRenderer::Ariadne),
+        );
+        assert!(
+            text.contains("\u{1b}["),
+            "default must keep SGR color: {text:?}"
+        );
+        assert!(
+            text.contains("\u{1b}]8;"),
+            "default must keep OSC 8: {text:?}"
+        );
+    }
+
+    /// Color and hyperlinks are independent: color off with hyperlinks on
+    /// keeps OSC 8 but emits no SGR code.
+    #[cfg(feature = "ariadne")]
+    #[test]
+    fn color_off_keeps_hyperlinks() {
+        let (fixtures, _dirs) = escape_fixtures();
+        let opts = TextRenderOptions::default().color(false);
+        for name in ["real_file", "notebook_origin"] {
+            let (_, ctx, msg, _) = fixtures.iter().find(|f| f.0 == name).unwrap();
+            let text = msg.to_text_with_renderer(Some(ctx), &opts, Some(SourceRenderer::Ariadne));
+            assert!(
+                text.contains("\u{1b}]8;"),
+                "{name}: hyperlinks stay on with color off: {text:?}"
+            );
+            assert!(
+                !text.contains("\u{1b}["),
+                "{name}: no SGR code with color off: {text:?}"
+            );
+        }
+    }
+
+    /// annotate-snippets never emits OSC 8, so color off alone already
+    /// yields escape-free text, even with hyperlinks requested.
+    #[cfg(feature = "annotate-snippets")]
+    #[test]
+    fn annotate_snippets_color_off_has_no_escape_bytes() {
+        let (fixtures, _dirs) = escape_fixtures();
+        let opts = TextRenderOptions::default().color(false);
+        for (name, ctx, msg, _) in &fixtures {
+            let text =
+                msg.to_text_with_renderer(Some(ctx), &opts, Some(SourceRenderer::AnnotateSnippets));
+            assert!(
+                !text.contains('\u{1b}'),
+                "{name}: no escape byte expected; got:\n{text:?}"
+            );
+        }
     }
 }
