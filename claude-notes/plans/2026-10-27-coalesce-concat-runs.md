@@ -1,7 +1,7 @@
 # Coalesce diagnostics located in `Concat`-shaped sources
 
 **GitHub:** [#10](https://github.com/posit-dev/quarto-error-reporting/issues/10)
-· **Strand:** qe-bju8tz7x (follow-up qe-rkscku9j; source-map qsm-m9xmq12h)
+· **Strand:** qe-bju8tz7x (follow-up qe-rkscku9j; source-map qsm-m9xmq12h; q2 bd-btoxaf07)
 · **Status:** in progress — PRs open, releases await review
 
 ## Overview
@@ -233,14 +233,18 @@ repo's CI builds `--locked`, so `Cargo.lock` is committed with the bump.
 - [ ] After 0.3.1 publishes: remove the patch section,
       `cargo update -p quarto-source-map`, commit `Cargo.lock`.
 - [x] `cargo xtask verify`.
-- [ ] Bump to 0.4.1 in the same PR; open PR referencing #10, merge,
-      confirm publish and `v0.4.1` tag. Close #10 from the PR.
+- [x] Bump to 0.4.1 as the tip commit; draft PR
+      [#11](https://github.com/posit-dev/quarto-error-reporting/pull/11)
+      ("Fixes #10").
+- [ ] Merge, confirm publish and `v0.4.1` tag.
 
 ### Phase 3: q2
 
-- [ ] Branch in q2. `[workspace.dependencies]`:
-      `quarto-source-map = "0.3.1"`, `quarto-error-reporting = "0.4.1"`;
-      `cargo update -p quarto-source-map -p quarto-error-reporting`.
+- [x] Branch `coalesce-concat-runs` in q2 (strand bd-btoxaf07).
+      `[workspace.dependencies]`: `quarto-source-map = "0.3.1"`,
+      `quarto-error-reporting = "0.4.1"`; committed `[patch.crates-io]`
+      git entries to both PR branches (REMOVE BEFORE MERGE); lockfile
+      updated.
 - [ ] Integration tests in
       `crates/quarto/tests/integration/coalesced_diagnostics.rs`:
   - [ ] Issue fixture (folded single-quoted `page-footer.right`, three
