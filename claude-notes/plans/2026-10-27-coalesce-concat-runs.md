@@ -2,7 +2,7 @@
 
 **GitHub:** [#10](https://github.com/posit-dev/quarto-error-reporting/issues/10)
 · **Strand:** qe-bju8tz7x (follow-up qe-rkscku9j; source-map qsm-m9xmq12h; q2 bd-btoxaf07)
-· **Status:** in progress — PRs open, releases await review
+· **Status:** crates released (source-map 0.3.1, error-reporting 0.4.1); q2 PR #937 open
 
 ## Overview
 
@@ -237,7 +237,8 @@ repo's CI builds `--locked`, so `Cargo.lock` is committed with the bump.
 - [x] Bump to 0.4.1 as the tip commit; draft PR
       [#11](https://github.com/posit-dev/quarto-error-reporting/pull/11)
       ("Fixes #10").
-- [ ] Merge, confirm publish and `v0.4.1` tag.
+- [x] Merged 2026-10-27 (squash); release workflow published 0.4.1 and
+      tagged `v0.4.1`. GH #10 closed by the merge.
 
 ### Phase 3: q2
 
@@ -246,24 +247,35 @@ repo's CI builds `--locked`, so `Cargo.lock` is committed with the bump.
       `quarto-error-reporting = "0.4.1"`; committed `[patch.crates-io]`
       git entries to both PR branches (REMOVE BEFORE MERGE); lockfile
       updated.
-- [ ] Integration tests in
+- [x] Integration tests in
       `crates/quarto/tests/integration/coalesced_diagnostics.rs`:
-  - [ ] Issue fixture (folded single-quoted `page-footer.right`, three
-        pages): exactly 6 `Q-2-9` emissions, each tailed by all three
-        pages; the `_quarto.yml` snippet still renders for the folded
-        ones.
-  - [ ] Block scalar (`center: |`) fixture extended to three pages:
-        2 emissions, each with the "Affected files:" tail (the
-        existing single-page test keeps asserting 2 and no tail).
-- [ ] Before the publishes land: verify with `[patch.crates-io]` to the
-      local checkouts; after: verify with the released versions. Run
-      the issue fixture against the built `q2` (expect 6 / 6 affected
-      lines) and, if convenient, the posit-dev/product-doc-theme
-      example from the issue (expect 8 instead of 24).
-- [ ] Run `coalesced_diagnostics`, `json_errors`,
-      `diagnostic_render_panic_boundary` integration tests plus
-      `quarto-core` unit tests.
-- [ ] PR to q2; record the verification run here.
+  - [x] `folded_scalar_config_warnings_coalesce_across_pages`: issue
+        fixture, three pages, exactly 6 `Q-2-9` emissions each tailed
+        by a, b, c; the folded scalar's second line renders in a
+        snippet.
+  - [x] `block_scalar_config_warnings_coalesce_across_pages`: block
+        scalar fixture over three pages, 2 emissions each tailed by all
+        three (the single-page test keeps asserting 2 and no tail).
+- [x] Verified against the PR branches (git `[patch.crates-io]`) and
+      again against the published releases. Built `q2`, issue fixture:
+      14 `Q-2-9` emissions / 2 tails on 0.36.0-nightly.20261024 → 6 / 6.
+      product-doc-theme `example/` at its pre-workaround config
+      (raw-HTML footer items; six pages, not the issue's five): 28 → 8.
+- [x] `coalesced_diagnostics`, `json_errors`,
+      `diagnostic_render_panic_boundary` integration tests: 39 passed,
+      both before and after the re-pin. `cargo clippy -p quarto
+      --all-targets -D warnings` clean. (`quarto-core` unit tests not
+      run separately: no q2 code changed.)
+- [x] PR [quarto-dev/q2#937](https://github.com/quarto-dev/q2/pull/937).
+      Note: the branch's first commit (bumps + tests + git patches)
+      landed on q2 `main` directly by mistake (`push.default =
+      upstream` with the branch tracking `origin/main`); main then
+      moved on with another merge, so the PR's contribution is the
+      second commit, which drops the patches and pins the registry
+      releases. Until it merges, the `resolved-runs` (source-map) and
+      `coalesce-concat-runs` (error-reporting) remote branches must stay
+      so q2 main's lockfile pins remain fetchable.
+- [ ] q2 PR #937 merged.
 
 ## Decisions from review (2026-10-27)
 
