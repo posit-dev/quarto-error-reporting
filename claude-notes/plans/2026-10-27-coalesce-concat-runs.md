@@ -199,7 +199,8 @@ repo's CI builds `--locked`, so `Cargo.lock` is committed with the bump.
       -- -D warnings`, `cargo test --locked`.
 - [x] Bump to 0.3.1 as the tip commit; draft PR
       [quarto-source-map#9](https://github.com/posit-dev/quarto-source-map/pull/9).
-- [ ] Merge, confirm crates.io publish and `v0.3.1` tag.
+- [x] Merged 2026-10-27; release workflow published 0.3.1 and tagged
+      `v0.3.1`.
 
 ### Phase 2: quarto-error-reporting 0.4.1
 
@@ -230,7 +231,7 @@ repo's CI builds `--locked`, so `Cargo.lock` is committed with the bump.
 - [x] Dep set to `quarto-source-map = "0.3.1"`; a committed
       `[patch.crates-io]` to the source-map PR branch (git, not a local
       path) keeps CI reproducible until 0.3.1 publishes.
-- [ ] After 0.3.1 publishes: remove the patch section,
+- [x] After 0.3.1 publishes: remove the patch section,
       `cargo update -p quarto-source-map`, commit `Cargo.lock`.
 - [x] `cargo xtask verify`.
 - [x] Bump to 0.4.1 as the tip commit; draft PR
