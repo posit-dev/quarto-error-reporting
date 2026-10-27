@@ -2,7 +2,7 @@
 
 **GitHub:** [#10](https://github.com/posit-dev/quarto-error-reporting/issues/10)
 · **Strand:** qe-bju8tz7x (follow-up qe-rkscku9j; source-map qsm-m9xmq12h; q2 bd-btoxaf07)
-· **Status:** crates released (source-map 0.3.1, error-reporting 0.4.1); q2 PR #937 open
+· **Status:** done — source-map 0.3.1, error-reporting 0.4.1 released; q2#937 merged 2026-10-27
 
 ## Overview
 
@@ -275,7 +275,10 @@ repo's CI builds `--locked`, so `Cargo.lock` is committed with the bump.
       releases. Until it merges, the `resolved-runs` (source-map) and
       `coalesce-concat-runs` (error-reporting) remote branches must stay
       so q2 main's lockfile pins remain fetchable.
-- [ ] q2 PR #937 merged.
+- [x] q2 PR #937 merged 2026-10-27 (merge commit `c9931c1da`); the
+      `resolved-runs` and `coalesce-concat-runs` remote branches deleted
+      afterwards. The one CI failure was a preview-renderer hover-geometry
+      test on macOS (unrelated TypeScript, passed on re-run).
 
 ## Decisions from review (2026-10-27)
 
