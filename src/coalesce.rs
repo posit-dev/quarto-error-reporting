@@ -47,27 +47,35 @@
 //! - the same id resolving in one entry's context but not another's
 //!   (e.g. one entry has no context at all) forms two groups.
 //!
+//! # The key is the location's run list
+//!
+//! A location is keyed by [`SourceInfo::resolved_runs`]: the ordered
+//! list of source runs its content maps onto, each run's file resolved
+//! through the entry's context as above. That covers every shape the
+//! renderer can draw: an `Original` is one run, a `Substring` composes
+//! onto its parent, a [`SourceInfo::Concat`] contributes one run per
+//! piece (adjacent same-file runs merged), and a `Substring` over a
+//! `Concat` — the shape of a diagnostic re-parsed out of a folded
+//! multi-line YAML scalar (GH #10) — is sliced through the pieces it
+//! covers. Two locations with equal endpoints but different interiors
+//! key differently, so the key never merges falsely; a `Concat` whose
+//! pieces tile the source contiguously keys the same as the
+//! equivalent `Original`.
+//!
 //! # What does not coalesce
 //!
-//! Diagnostics whose `location` is one of:
-//!
-//! - `None`,
-//! - [`SourceInfo::Concat`], or
-//! - [`SourceInfo::FilterProvenance`],
-//!
-//! pass through as singleton groups (one entry each). These shapes
-//! don't reduce to a single contiguous byte range, so we can't form
-//! a stable group key for them. This is the same conservative
-//! contract as [`SourceInfo::resolve_byte_range`].
+//! Diagnostics whose `location` is `None`, or whose location has no
+//! runs (a `Generated` without an `Invocation` anchor; a range that
+//! falls outside every piece of a `Concat`), pass through as
+//! singleton groups (one entry each).
 //!
 //! [`SourceInfo::Concat`]: quarto_source_map::SourceInfo::Concat
-//! [`SourceInfo::FilterProvenance`]: quarto_source_map::SourceInfo::FilterProvenance
-//! [`SourceInfo::resolve_byte_range`]: quarto_source_map::SourceInfo::resolve_byte_range
+//! [`SourceInfo::resolved_runs`]: quarto_source_map::SourceInfo::resolved_runs
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use quarto_source_map::{FileId, SourceContext, SourceInfo};
+use quarto_source_map::{SourceContext, SourceInfo};
 
 use crate::diagnostic::{DiagnosticMessage, TextRenderOptions};
 
@@ -154,34 +162,38 @@ enum FileKey {
 
 /// Canonical, hashable form of a [`SourceInfo`] for grouping.
 ///
-/// Resolves to the root `Original`'s byte range, with the file
-/// component resolved through the entry's own `SourceContext` (see
-/// [`FileKey`]). Returns `None` for shapes that don't reduce cleanly
-/// (mirrors [`SourceInfo::resolve_byte_range`]).
+/// The location's [`SourceInfo::resolved_runs`], in order, with each
+/// run's file resolved through the entry's own `SourceContext` (see
+/// [`FileKey`]). `None` when the location has no runs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct LocationKey {
-    file: FileKey,
-    start: usize,
-    end: usize,
+    runs: Vec<(FileKey, usize, usize)>,
 }
 
 impl LocationKey {
     fn from(info: &SourceInfo, ctx: Option<&SourceContext>) -> Option<Self> {
-        let (file_id, start, end) = info.resolve_byte_range()?;
-        let file = match ctx.and_then(|c| c.get_file(FileId(file_id))) {
-            Some(f) => FileKey::Path(f.path.clone()),
-            None => FileKey::Raw(file_id),
-        };
-        Some(LocationKey { file, start, end })
+        let runs = info
+            .resolved_runs()?
+            .into_iter()
+            .map(|run| {
+                let file = match ctx.and_then(|c| c.get_file(run.file_id)) {
+                    Some(f) => FileKey::Path(f.path.clone()),
+                    None => FileKey::Raw(run.file_id.0),
+                };
+                (file, run.start, run.end)
+            })
+            .collect();
+        Some(LocationKey { runs })
     }
 }
 
 /// Group the input by source location and return one
 /// [`CoalescedDiagnostic`] per group, in encounter order.
 ///
-/// Inputs without a coalescable location (no `location`, or `Concat`
-/// / `FilterProvenance`) pass through as singleton groups in their
-/// original order — they always print exactly once.
+/// Inputs without a coalescable location (no `location`, or a
+/// location with no resolved runs — see the module docs) pass through
+/// as singleton groups in their original order — they always print
+/// exactly once.
 ///
 /// The first `(path, diagnostic, source_context)` triple to introduce
 /// a given key becomes the group's representative. Later triples
@@ -236,7 +248,7 @@ where
 mod tests {
     use super::*;
     use crate::builder::DiagnosticMessageBuilder;
-    use quarto_source_map::{FileId, SourcePiece};
+    use quarto_source_map::{By, FileId};
     use std::sync::Arc;
 
     fn original(file_id: usize, start: usize, end: usize) -> SourceInfo {
@@ -332,22 +344,165 @@ mod tests {
         assert_eq!(groups.len(), 2);
     }
 
+    /// The folded-scalar shape from GH #10: a `Concat` whose pieces
+    /// tile `_quarto.yml` contiguously — verbatim text, a folded
+    /// newline+indent replaced by one space, verbatim text.
+    fn folded_scalar(file_id: usize) -> SourceInfo {
+        SourceInfo::concat(vec![
+            (original(file_id, 40, 56), 16),
+            (original(file_id, 56, 63), 1),
+            (original(file_id, 63, 80), 17),
+        ])
+    }
+
     #[test]
-    fn concat_location_passes_through_as_singleton() {
-        let concat = SourceInfo::Concat {
-            pieces: vec![SourcePiece {
-                source_info: original(1, 0, 10),
-                offset_in_concat: 0,
-                length: 10,
-            }],
-        };
+    fn same_concat_location_collapses() {
+        let concat = folded_scalar(1);
         let input = vec![
             (PathBuf::from("a.qmd"), diag_at(concat.clone(), "T"), None),
             (PathBuf::from("b.qmd"), diag_at(concat, "T"), None),
         ];
         let groups = coalesce_by_source(input);
-        // Both emitted as singletons because Concat has no
-        // coalescable key. Order preserved.
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].affected_files,
+            vec![PathBuf::from("a.qmd"), PathBuf::from("b.qmd")]
+        );
+    }
+
+    #[test]
+    fn same_substring_over_concat_collapses() {
+        // A tag re-parsed out of the folded scalar's second line: the
+        // exact shape q2's Q-2-9 carries (GH #10).
+        let loc = SourceInfo::substring(folded_scalar(1), 17, 34);
+        assert_eq!(
+            loc.resolve_byte_range(),
+            None,
+            "sanity: the old key refused this shape"
+        );
+        let input: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                (
+                    PathBuf::from(format!("{n}.qmd")),
+                    diag_at(loc.clone(), "T"),
+                    None,
+                )
+            })
+            .collect();
+        let groups = coalesce_by_source(input);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].affected_files.len(), 3);
+    }
+
+    #[test]
+    fn different_substrings_over_the_same_concat_do_not_collapse() {
+        let parent = folded_scalar(1);
+        let input = vec![
+            (
+                PathBuf::from("a.qmd"),
+                diag_at(SourceInfo::substring(parent.clone(), 0, 16), "open"),
+                None,
+            ),
+            (
+                PathBuf::from("a.qmd"),
+                diag_at(SourceInfo::substring(parent, 17, 34), "close"),
+                None,
+            ),
+        ];
+        let groups = coalesce_by_source(input);
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn same_concat_resolving_to_different_paths_does_not_collapse() {
+        // Same piece list, but each entry's context registers the id
+        // under a different path: two files, two groups (GH #3's
+        // protection, carried over to the run-list key).
+        let concat = folded_scalar(1);
+        let mut ctx_a = SourceContext::new();
+        ctx_a.add_file_with_id(FileId(1), "a/_quarto.yml".into(), Some(String::new()));
+        let mut ctx_b = SourceContext::new();
+        ctx_b.add_file_with_id(FileId(1), "b/_quarto.yml".into(), Some(String::new()));
+        let input = vec![
+            (
+                PathBuf::from("a.qmd"),
+                diag_at(concat.clone(), "T"),
+                Some(ctx_a),
+            ),
+            (PathBuf::from("b.qmd"), diag_at(concat, "T"), Some(ctx_b)),
+        ];
+        let groups = coalesce_by_source(input);
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn equal_endpoints_with_different_interiors_do_not_collapse() {
+        // Two gapped Concats sharing start and end but not the gap: an
+        // endpoint-only key (option 1 in GH #10) would merge them; the
+        // run-list key keeps them apart.
+        let a = SourceInfo::concat(vec![(original(1, 0, 10), 10), (original(1, 20, 30), 10)]);
+        let b = SourceInfo::concat(vec![(original(1, 0, 5), 5), (original(1, 25, 30), 5)]);
+        let input = vec![
+            (PathBuf::from("a.qmd"), diag_at(a, "T"), None),
+            (PathBuf::from("b.qmd"), diag_at(b, "T"), None),
+        ];
+        let groups = coalesce_by_source(input);
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn tiled_concat_collapses_with_the_equivalent_original() {
+        // The folded scalar's pieces tile 40..80, so a diagnostic on the
+        // whole scalar keys like one located at Original 40..80.
+        let input = vec![
+            (PathBuf::from("a.qmd"), diag_at(folded_scalar(1), "T"), None),
+            (
+                PathBuf::from("b.qmd"),
+                diag_at(original(1, 40, 80), "T"),
+                None,
+            ),
+        ];
+        let groups = coalesce_by_source(input);
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn cross_file_concat_collapses_when_both_entries_agree() {
+        // Notebook-cell shape: pieces in two files. One file resolves
+        // through the context (Path), the other does not (Raw); the key
+        // is per-run, so identical locations with identical contexts
+        // still group.
+        let cells = SourceInfo::concat(vec![(original(1, 0, 10), 10), (original(2, 0, 10), 10)]);
+        let mk_ctx = || {
+            let mut c = SourceContext::new();
+            c.add_file_with_id(FileId(1), "cell-1".into(), Some(String::new()));
+            c
+        };
+        let input = vec![
+            (
+                PathBuf::from("a.ipynb"),
+                diag_at(cells.clone(), "T"),
+                Some(mk_ctx()),
+            ),
+            (
+                PathBuf::from("b.ipynb"),
+                diag_at(cells, "T"),
+                Some(mk_ctx()),
+            ),
+        ];
+        let groups = coalesce_by_source(input);
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn generated_without_anchor_passes_through_as_singleton() {
+        let loc = SourceInfo::generated(By::sectionize());
+        let input = vec![
+            (PathBuf::from("a.qmd"), diag_at(loc.clone(), "T"), None),
+            (PathBuf::from("b.qmd"), diag_at(loc, "T"), None),
+        ];
+        let groups = coalesce_by_source(input);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].affected_files, vec![PathBuf::from("a.qmd")]);
         assert_eq!(groups[1].affected_files, vec![PathBuf::from("b.qmd")]);
